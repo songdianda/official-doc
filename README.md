@@ -16,7 +16,7 @@
 1. 将本项目克隆到本地：
 
 ```bash
-git clone https://github.com/shuyu/official-doc.git
+git clone https://github.com/BruceShuyuLan/official-doc.git
 ```
 
 2. 在 Claude Code 中使用 `/official-doc` 命令，按提示提供公文内容即可生成规范公文。
