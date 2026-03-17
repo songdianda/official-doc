@@ -1,6 +1,8 @@
 # official-doc
 
-一个 [Claude Code](https://claude.com/claude-code) 技能（Skill），用于根据**党政机关公文格式国家标准（GB/T 9704—2012）**自动生成规范的 `.docx` 公文文件。
+一个 AI 编程助手技能（Skill），用于根据**党政机关公文格式国家标准（GB/T 9704—2012）**自动生成规范的 `.docx` 公文文件。
+
+支持 [Claude Code](https://claude.com/claude-code) / [OpenCode](https://github.com/opencode-ai/opencode) / [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) 等终端 AI 编程工具。
 
 ## 功能特性
 
@@ -11,24 +13,14 @@
 
 ## 使用方式
 
-### 作为 Claude Code Skill 使用
+1. 点击本页面右上角绿色的 **Code** 按钮，选择 **Download ZIP**，下载后解压到任意文件夹
+2. 用你喜欢的终端 AI 工具打开解压后的文件夹：
+   - **Claude Code**：运行 `claude` 进入，输入 `/official-doc`
+   - **OpenCode**：运行 `opencode` 进入
+   - **Kimi CLI**：运行 `kimi` 进入
+3. 告诉 AI 你要生成公文，提供公文内容即可（AI 会自动读取 `.claude/skills/official-doc.md` 中的排版规范）
 
-1. 将本项目克隆到本地：
-
-```bash
-git clone https://github.com/BruceShuyuLan/official-doc.git
-```
-
-2. 在 Claude Code 中使用 `/official-doc` 命令，按提示提供公文内容即可生成规范公文。
-
-### 直接运行示例脚本
-
-```bash
-pip install python-docx
-python generate_gongwen.py
-```
-
-生成的文件将保存到桌面。
+生成的 `.docx` 文件会保存到你的桌面。
 
 ## 公文格式规范
 
