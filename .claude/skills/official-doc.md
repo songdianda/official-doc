@@ -202,11 +202,31 @@ def set_line_spacing_fixed(paragraph, pt_value):
     spacing.set(qn('w:before'), '0')
     spacing.set(qn('w:after'), '0')
 
+# 设置首行缩进（2字符）
+# 注意：python-docx 的 Normal 样式自带 firstLineChars=200，
+# 必须先清除所有已有缩进属性，再同时设置 firstLineChars 和 firstLine，
+# 否则会与默认值叠加导致缩进翻倍。
+def set_paragraph_indent(paragraph, chars=2):
+    pPr = paragraph._element.get_or_add_pPr()
+    ind = pPr.find(qn('w:ind'))
+    if ind is None:
+        ind = OxmlElement('w:ind')
+        pPr.append(ind)
+    # 清除所有已有的缩进属性，避免与 Normal 样式叠加
+    for attr in ['w:firstLine', 'w:firstLineChars', 'w:left', 'w:leftChars',
+                 'w:hanging', 'w:hangingChars', 'w:start', 'w:end']:
+        if ind.get(qn(attr)):
+            del ind.attrib[qn(attr)]
+    # 同时设置字符单位和绝对值（Word 以字符单位优先）
+    ind.set(qn('w:firstLineChars'), str(chars * 100))
+    ind.set(qn('w:firstLine'), str(chars * 320))
+
 # 标题：行距 32 磅
 set_line_spacing_fixed(title_paragraph, 32)
 
-# 正文/主送机关：行距 28 磅
+# 正文/主送机关：行距 28 磅，首行缩进 2 字符
 set_line_spacing_fixed(body_paragraph, 28)
+set_paragraph_indent(body_paragraph, 2)
 ```
 
 ---
