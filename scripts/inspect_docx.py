@@ -146,7 +146,99 @@ def load_numbering_defs(doc):
     return nums
 
 
-def resolve_auto_number(p, defs, counters, last_values):
+def load_style_numbering(doc):
+    """解析 styles.xml → {styleId: numPr元素}（沿 basedOn 继承链向上找）。
+
+    编号规则可能挂在**段落样式**上而不是段落自身（Word 的"多级列表"常见做法），
+    只看段落的 w:pPr/w:numPr 会整条丢失编号。
+    """
+    part = None
+    try:
+        from docx.opc.constants import RELATIONSHIP_TYPE as RT
+        part = doc.part.part_related_by(RT.STYLES)
+    except Exception:
+        part = None
+    if part is None:
+        # 不同版本 python-docx 暴露 styles part 的方式不一致，兜底按名字找
+        try:
+            for p in doc.part.package.iter_parts():
+                if str(p.partname).endswith('/styles.xml'):
+                    part = p
+                    break
+        except Exception:
+            part = None
+    if part is None:
+        return {}
+    raw = {}
+    for s in part.element.iter(qn('w:style')):
+        sid = s.get(qn('w:styleId'))
+        if not sid:
+            continue
+        pPr = s.find(qn('w:pPr'))
+        numPr = pPr.find(qn('w:numPr')) if pPr is not None else None
+        base_el = pPr.find(qn('w:basedOn')) if pPr is not None else None
+        raw[sid] = {'numPr': numPr,
+                    'basedOn': base_el.get(qn('w:val')) if base_el is not None else None}
+
+    out = {}
+    for sid in raw:
+        seen, cur, found = set(), sid, None
+        while cur and cur in raw and cur not in seen:
+            seen.add(cur)
+            if raw[cur]['numPr'] is not None:
+                found = raw[cur]['numPr']
+                break
+            cur = raw[cur]['basedOn']
+        if found is not None:
+            out[sid] = found
+    return out
+
+
+LEVEL_PATTERNS = [
+    ('一、', re.compile(r'^([一二三四五六七八九十]+)、')),
+    ('（一）', re.compile(r'^（([一二三四五六七八九十]+)）')),
+    # 后接 (?!\d) 排除多级编号：否则「1.」与「1.1.」会被当成同一个 1 而误报重复
+    ('1.', re.compile(r'^(\d+)[.、](?!\d)')),
+    ('（1）', re.compile(r'^（(\d+)）')),
+    ('①', re.compile(r'^([①-⑳])')),
+]
+
+
+def detect_number_conflicts(paras):
+    """找出重复出现的同级编号。
+
+    手打编号与 Word 自动编号混用时最容易撞号：自动编号按自己的计数走，
+    手打的那条它不知道，于是文档里出现两个「一、」。
+    **只报告、不自动改**——重复既可能是原文就错，也可能是两套编号各算一套，
+    擅自改会乱层级，交给使用者判断。
+    """
+    seen = {}
+    conflicts = []
+    for sig in paras:
+        text = (sig.get('text') or '').strip()
+        if not text:
+            continue
+        source = '自动编号补回' if sig.get('autoNumber') else '原文'
+        for label, pat in LEVEL_PATTERNS:
+            m = pat.match(text)
+            if not m:
+                continue
+            key = (label, m.group(1))
+            if key in seen:
+                prev_idx, prev_src = seen[key]
+                conflicts.append({
+                    'level': label, 'value': m.group(1),
+                    'first': {'index': prev_idx, 'source': prev_src},
+                    'again': {'index': sig['index'], 'source': source},
+                    'text': text[:40],
+                })
+            else:
+                seen[key] = (sig['index'], source)
+            break
+    return conflicts
+
+
+def resolve_auto_number(p, defs, counters, last_values, style_num=None):
     """算出 Word 自动编号在该段应该显示的文本（如「二、」）。
 
     python-docx 的 p.text 只取 w:t，自动编号不在文本里而挂在 w:numPr 上，
@@ -158,9 +250,11 @@ def resolve_auto_number(p, defs, counters, last_values):
     if not defs:
         return None, None
     pPr = p._element.pPr
-    if pPr is None:
-        return None, None
-    numPr = pPr.find(qn('w:numPr'))
+    numPr = pPr.find(qn('w:numPr')) if pPr is not None else None
+    if numPr is None and style_num:
+        # 编号规则挂在段落样式上时（多级列表常见），段落自身没有 numPr
+        sid = p.style.style_id if p.style is not None else None
+        numPr = style_num.get(sid) if sid else None
     if numPr is None:
         return None, None
     ilvl_el = numPr.find(qn('w:ilvl'))
@@ -181,6 +275,23 @@ def resolve_auto_number(p, defs, counters, last_values):
         counters[key] = d.get('start', 1)
     value = counters[key]
     last_values[key] = value
+
+    # 本级计数推进后，所有**更深**的层级回到各自起始值。
+    # Word 的行为是进入新的一级标题后，其下的二级标题从 1 重新数；
+    # 不重置的话第二章的二级会接着第一章数成「2.3.」而不是「2.1.」。
+    try:
+        cur = int(ilvl)
+    except (TypeError, ValueError):
+        cur = 0
+    for k in list(counters):
+        if k[0] != numid:
+            continue
+        try:
+            if int(k[1]) > cur:
+                counters[k] = defs.get(numid, {}).get(k[1], {}).get('start', 1) - 1
+                last_values.pop(k, None)
+        except (TypeError, ValueError):
+            continue
 
     rendered = format_number(value, d.get('fmt'))
     lvl_text = d.get('lvlText', '%1.')
@@ -421,6 +532,19 @@ def _para_has_image(el):
             or any(True for _ in el.iter(qn('w:pict'))))
 
 
+def _textbox_text(el):
+    """取文本框（w:txbxContent）里的文字。
+
+    文本框内的 w:t 不在段落的直接 w:r 下，python-docx 的 p.text 读不到——
+    文本框版红头因此会显示成"空段落"，仅靠图片判定捞它并不可靠。
+    """
+    parts = []
+    for box in el.iter(qn('w:txbxContent')):
+        for t in box.iter(qn('w:t')):
+            parts.append(t.text or '')
+    return ''.join(parts).strip()
+
+
 def detect_letterhead(paras, elements):
     """识别红头（发文机关标志）、发文字号、红色分隔线。
 
@@ -434,7 +558,10 @@ def detect_letterhead(paras, elements):
     got_number = False
     for i in range(min(len(paras), 6)):
         text = paras[i]['text'].strip()
-        if not text:
+        # 文本框里的字不在段落的直接 w:r 下，p.text 读不到，单独取出来参与判定
+        box = _textbox_text(elements[i]) if not text else ''
+        probe = text or box
+        if not probe:
             if _para_has_border(elements[i]) or _para_has_image(elements[i]):
                 picked.append(i)
                 detail.append({'index': i, 'text': '(分隔线)' if not _para_has_image(elements[i]) else '(红头图片)',
@@ -454,16 +581,20 @@ def detect_letterhead(paras, elements):
         if _para_max_size(elements[i]) >= 22:
             score += 1
             reasons.append('字号≥二号')
-        if DOC_NUMBER.match(text):
+        if DOC_NUMBER.match(probe):
             score += 3
             reasons.append('发文字号格式')
             got_number = True
-        if text.endswith('文件') and i <= 2:
+        if probe.endswith('文件') and i <= 2:
             score += 2
             reasons.append('以"文件"结尾')
+        if box and i <= 2:
+            score += 1            # 文本框本身是做版头的常见做法
+            reasons.append('文本框内文字')
         if score >= 2:
             picked.append(i)
-            detail.append({'index': i, 'text': text, 'reason': '、'.join(reasons)})
+            detail.append({'index': i, 'text': probe,
+                           'reason': '、'.join(reasons)})
             continue
         break
     return picked, detail
@@ -493,11 +624,24 @@ def build(path):
 
     # Word 自动编号（w:numPr）不在 w:t 里，必须单独解析，否则整条编号丢失
     num_defs = load_numbering_defs(doc)
+    # 编号规则可能挂在段落样式上（多级列表常见），段落自身没有 numPr
+    style_num = load_style_numbering(doc)
     counters, last_values = {}, {}
+
+    # 文档以表格开头时，那个表格很可能是表格式版头（红头 + 文号）。
+    # 本技能不会把它当版头原样保留，必须说出来，不能默默按普通表格排掉。
+    warnings = []
+    if flow and flow[0][0] == 't':
+        warnings.append(
+            '文档以表格开头：若该表格是表格式版头（红头 + 发文字号），'
+            '本技能按普通表格处理，它会被排在标题之后。'
+            '如需原样保留为版头，请先在源文档中改为文字 / 图片 / 文本框版红头，'
+            '或在生成后手工调整。')
 
     for kind, obj in flow:
         if kind == 'p':
-            prefix, info = resolve_auto_number(obj, num_defs, counters, last_values)
+            prefix, info = resolve_auto_number(obj, num_defs, counters,
+                                               last_values, style_num)
             sig = para_signals(obj, len(paras), prefix, info)
             paras.append(sig)
             elements.append(obj._element)
@@ -637,7 +781,9 @@ def build(path):
         result['header'] = {
             'source': os.path.abspath(path),
             'indices': head_idx,
-            'texts': [paras[i]['text'].strip() for i in head_idx],
+            # 文本框内的字 p.text 取不到，用判定时的 probe 才能看到实际内容
+            'texts': [next((d['text'] for d in head_detail if d['index'] == i),
+                           paras[i]['text'].strip()) for i in head_idx],
         }
         result['_head_detail'] = head_detail
     if candidates:
@@ -646,6 +792,11 @@ def build(path):
         result['_page_number'] = pn['detail']
     if auto_numbered:
         result['_auto_number'] = auto_numbered
+    conflicts = detect_number_conflicts(paras)
+    if conflicts:
+        result['_number_conflicts'] = conflicts
+    if warnings:
+        result['_warnings'] = warnings
     if tables:
         result['tables'] = tables
     return result
@@ -707,6 +858,16 @@ def main():
             for t in head['texts']:
                 if t:
                     print(f'   {t}')
+        conf = result.get('_number_conflicts') or []
+        if conf:
+            print(f'编号冲突：{len(conf)} 处同级编号重复，请核对（可能是手打编号与'
+                  f' Word 自动编号各算一套）：')
+            for c in conf:
+                print(f"   「{c['value']}」在第{c['first']['index']}段"
+                      f"（{c['first']['source']}）与第{c['again']['index']}段"
+                      f"（{c['again']['source']}）重复：{c['text']}")
+        for w in result.get('_warnings') or []:
+            print(f'提示：{w}')
         tabs = result.get('tables') or []
         if tabs:
             merged = sum(1 for t in tabs if t.get('spans'))
