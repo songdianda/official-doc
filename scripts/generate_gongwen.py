@@ -290,6 +290,73 @@ def add_blank(doc, line_spacing=LINE_BODY):
     return para
 
 
+# VML（老式 w:pict 图片）命名空间，python-docx 的 nsmap 里没有，需手写
+VML_NS = 'urn:schemas-microsoft-com:vml'
+
+
+def _rebuild_images(src_doc, dst_doc, new_p):
+    """重建被复制段落里图片的关系 ID。
+
+    deepcopy 过来的 r:embed 仍指向源文档的 image part，在新文档里是悬空引用，
+    必须把图片重新加进目标文档并换成新的 rId，否则图片显示为空白甚至报损坏。
+    """
+    def rebuild(rid, setter):
+        if not rid or rid not in src_doc.part.related_parts:
+            return
+        img_part = src_doc.part.related_parts[rid]
+        try:
+            import io
+            # get_or_add_image 接受字节流，返回 (rId, image)
+            new_rid, _img = dst_doc.part.get_or_add_image(io.BytesIO(img_part.blob))
+            setter(new_rid)
+        except Exception as exc:
+            print(f'警告：版头中的图片未能复制（{exc}），该图可能显示为空白')
+
+    # Drawing（Office 2007+）与 VML（w:pict，老文档）两种图片都要处理
+    for blip in new_p.iter(qn('a:blip')):
+        rid = blip.get(qn('r:embed'))
+        rebuild(rid, lambda v, b=blip: b.set(qn('r:embed'), v))
+    # 注意：python-docx 的 nsmap 没有 VML 前缀，qn('v:...') 会 KeyError，须写完整 URI
+    for imagedata in new_p.iter(f'{{{VML_NS}}}imagedata'):
+        rid = imagedata.get(qn('r:id'))
+        rebuild(rid, lambda v, e=imagedata: e.set(qn('r:id'), v))
+
+
+def copy_letterhead(doc, spec):
+    """把源文档的版头（红头 / 发文字号 / 分隔线）原样复制到新文档开头。
+
+    整段 deepcopy w:p，字体、颜色、字号、对齐、边框一概照搬。
+    红头是各单位的门面，本技能**不重做红头**——重排等于替用户改门面。
+    """
+    import copy as copy_mod
+
+    src_path = spec.get('source')
+    indices = spec.get('indices') or []
+    if not src_path or not indices:
+        return 0
+    if not os.path.exists(src_path):
+        print(f'警告：找不到源文档 {src_path}，版头未保留（正文照常输出）')
+        return 0
+
+    src = Document(src_path)
+    elements = [p._element for p in src.paragraphs]
+    body = doc.element.body
+    sectPr = body.find(qn('w:sectPr'))
+    copied = 0
+    for i in indices:
+        if i >= len(elements):
+            continue
+        new_p = copy_mod.deepcopy(elements[i])
+        _rebuild_images(src, doc, new_p)
+        # sectPr 必须是 body 的最后一个子元素，不能直接 append 到末尾
+        if sectPr is not None:
+            sectPr.addprevious(new_p)
+        else:
+            body.append(new_p)
+        copied += 1
+    return copied
+
+
 def _row_width(row, srow):
     """行的逻辑列数：有合并信息时按 gridSpan 累加，否则按元素个数。"""
     if not srow:
@@ -585,6 +652,10 @@ def build_document(content, output_path):
     # 文档网格（5.2.3）：python-docx 默认模板残留学生 linePitch=360(18磅) 且缺 type，
     # 需显式改写为 28 磅行网格（560 twips），与固定行距一致，避免 Word 各行版本解释不一致。
     _set_doc_grid(section, line_pitch_twips=int(LINE_BODY * 20))
+
+    # 版头（红头 / 发文字号 / 分隔线）：源文档有就原样搬过来，不重新排版
+    if content.get('header'):
+        copy_letterhead(doc, content['header'])
 
     # 标题：小标宋 二号 居中 行距32磅
     title_para = doc.add_paragraph()

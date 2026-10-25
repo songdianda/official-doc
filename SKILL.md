@@ -2,9 +2,9 @@
 name: official-doc
 display_name: 公文格式排版
 display_name_en: Official Document Formatter
-description: 依据 GB/T 9704-2012 党政机关公文格式国标，把内容或现有 docx 重排为标准公文，保留编号与表格，自动检查结构层次编号错误；仅排正文部分，不生成红头与版记
-description_zh: 按党政机关公文格式国标(GB/T 9704-2012)把内容或现有 Word 重排为标准 DOCX 公文，保留编号与表格（含合并单元格），自动检查并修正"一、（一）1.（1）①"层级编号错误；仅排正文部分，不生成红头、发文字号与版记
-description_en: Reformat content or an existing Word file into a standard Chinese official DOCX per GB/T 9704-2012, preserving numbering and tables, with automatic structural numbering checks. Body text only - no letterhead, document number or endnotes
+description: 依据 GB/T 9704-2012 党政机关公文格式国标，把内容或现有 docx 重排为标准公文，源文件带红头与发文字号时原样保留、只重排正文，保留编号与表格，自动检查结构层次编号错误
+description_zh: 按党政机关公文格式国标(GB/T 9704-2012)把内容或现有 Word 重排为标准 DOCX 公文；源文件带红头、发文字号时原样保留、只重排正文，保留编号与表格（含合并单元格），自动检查并修正"一、（一）1.（1）①"层级编号错误
+description_en: Reformat content or an existing Word file into a standard Chinese official DOCX per GB/T 9704-2012; keeps existing letterhead and document number intact, preserving numbering and tables, with automatic structural numbering checks
 examples_zh:
   - "把这份会议纪要按公文格式排版成 Word"
   - "帮我检查这份公文的编号层级有没有错"
@@ -15,7 +15,7 @@ examples_en:
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
   - "Reformat this request with an attached table, keeping the original page numbering"
-version: 1.7.0
+version: 1.8.0
 author: songdianda
 ---
 
@@ -29,7 +29,8 @@ author: songdianda
 
 ## 工作流程
 
-1. **获取内容**：用户提供 `.docx` 路径时，用 `scripts/inspect_docx.py` 提取全文、样式线索与角色建议；脚本会**自动检测源文档是否已有页码**，**把落款署名与成文日期剥离到 `signature` / `date`**（生成器会重新输出，留在正文里会重复），并保留表格的合并单元格结构。
+1. **获取内容**：用户提供 `.docx` 路径时，用 `scripts/inspect_docx.py` 提取全文、样式线索与角色建议；脚本会**自动检测源文档是否已有页码**，**识别并剥离版头**（红头/发文字号/分隔线，原样保留不重排），**把落款署名与成文日期剥离到 `signature` / `date`**（生成器会重新输出，留在正文里会重复），并保留表格的合并单元格结构。
+   - **版头若不识别，红头会被当成标题排成二号小标宋，真正的标题反而沦为普通正文**——这一步不能跳。
    - 主送机关、附件说明**误判代价高**（删了就丢内容），脚本只列候选 `_candidates`，由你确认后填入对应字段并删除 body 中的该段。
 2. **判定段落角色**（关键）：逐段确定是标题还是编号正文，规则见 `references/paragraph-roles.md`。
    - 「1.」既可能是三级标题，也可能只是一条编号的工作事项，**不能只看编号**。
@@ -42,8 +43,9 @@ author: songdianda
 4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、输出路径。用户未提供的项目逐项询问，**不编造**。
    - **页码不在此列**：有源文件时以源文件为准（无页码就不加），无源文件时默认居中，交付时说明采用的值。
 5. **生成文件**：调用 `scripts/generate_gongwen.py`，格式参数见 `references/format-spec.md`。
-6. **交付**：告知输出路径、实际使用的字体（字体回退情况）、存疑段落的处理结果，
-   **并主动说明本技能不生成的要素**（红头、发文字号、版记、印章，见「不适用与能力边界」），
+6. **交付**：告知输出路径、实际使用的字体（字体回退情况）、存疑段落的处理结果、
+   **版头是否保留**（识别到几段、保留的是什么），
+   **并主动说明本技能不生成的要素**（版记、印章，以及源文件无版头时不生成红头），
    避免用户误以为拿到的是完整公文。完整说明见 `README.md`。
 
 ## 调用脚本
@@ -143,12 +145,30 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 ## 不适用与能力边界
 
-排版只覆盖**正文部分**，以下要素本技能不生成，交付时应向用户说明，避免被当成"完整公文"：
+### 版头：原样保留，不重做
+
+**源文件带红头和发文字号时，一律原样保留，不参与重排。** 红头是各单位的门面，替用户重排等于改他的门面。
+
+`inspect_docx.py` 会自动识别文档开头的红头、发文字号、红色分隔线（文字或图片都可），
+记录到 `header`，由生成器**整段原样复制**到新文档开头——字体、颜色、字号、对齐、边框全保留。
+
+识别规则（详见 `references/format-spec.md` 第 8 节）：
+
+- 只扫描**开头连续**的那几段：正文里引述「X教发〔2026〕15号」不会被当成版头删掉
+- 红色文字、字号 ≥ 二号、以「文件」结尾、符合发文字号格式——打分判定
+- 无文字但带段落边框（分隔线）或含图片（图片版红头）同样纳入
+- 识别到发文字号之后只再接受分隔线，避免把正文标题误纳入
+
+**识别不出、或源文件根本没有版头时，不凭空生成一个**——那需要套用单位红头模板。
+
+### 不生成的要素
+
+以下要素本技能不生成，交付时应向用户说明，避免被当成"完整公文"：
 
 | 不生成 | 说明 |
 |--------|------|
-| 红头（发文机关标志）、发文字号、签发人、分隔线 | 国标 7.2 的版头要素，需套用单位红头模板 |
-| 份号、密级、紧急程度 | 同上 |
+| 红头、发文字号、分隔线 | **源文件没有时不生成**（有则原样保留，见上） |
+| 签发人、份号、密级、紧急程度 | 国标 7.2 版头要素，本技能不处理 |
 | 版记（抄送机关、印发机关和印发日期） | 国标 7.4，需按单位版记格式另行排版 |
 | 印章位置、骑缝章 | 与用印流程绑定，不在排版范围 |
 

@@ -41,6 +41,18 @@ TERMINAL_PUNCT = '。；！？'
 DATE_FULL = re.compile(r'^\d{4}年\d{1,2}月\d{1,2}日$')
 # 附件说明（7.3.4）。
 ATTACH_PREFIX = re.compile(r'^附件[:：]')
+# 发文字号（7.2.4）：机关代字 + 〔年份〕 + 序号，如「X教发〔2026〕15号」
+DOC_NUMBER = re.compile(r'^[\u4e00-\u9fa5]{1,15}[〔\[（]\s*\d{4}\s*[〕\]）]\s*第?\s*\d+\s*号?$')
+
+# 红头常见色值：R 高、G/B 低（FF0000 / C00000 / E60000 等）
+def is_red_color(val):
+    if not val or val.lower() in ('auto', '000000'):
+        return False
+    try:
+        r, g, b = int(val[0:2], 16), int(val[2:4], 16), int(val[4:6], 16)
+    except (ValueError, IndexError):
+        return False
+    return r >= 0xA0 and g <= 0x60 and b <= 0x60
 
 
 CN_DIGITS = '零一二三四五六七八九十'
@@ -383,6 +395,80 @@ def extract_table(tbl):
     return rows, spans, ncol
 
 
+def _para_max_size(el):
+    """段落内最大字号（磅）。w:sz 存的是半磅值。"""
+    sizes = []
+    for sz in el.iter(qn('w:sz')):
+        try:
+            sizes.append(int(sz.get(qn('w:val'))) / 2.0)
+        except (TypeError, ValueError):
+            pass
+    return max(sizes) if sizes else 0
+
+
+def _para_is_red(el):
+    return any(is_red_color(c.get(qn('w:val'))) for c in el.iter(qn('w:color')))
+
+
+def _para_has_border(el):
+    pPr = el.find(qn('w:pPr'))
+    return pPr is not None and pPr.find(qn('w:pBdr')) is not None
+
+
+def _para_has_image(el):
+    """段落里是否有图片。很多单位的红头是图片而不是文字，必须一并保留。"""
+    return (any(True for _ in el.iter(qn('w:drawing')))
+            or any(True for _ in el.iter(qn('w:pict'))))
+
+
+def detect_letterhead(paras, elements):
+    """识别红头（发文机关标志）、发文字号、红色分隔线。
+
+    只扫描文档**开头连续**的那几段：正文里引述「X教发〔2026〕15号」不该被当成版头删掉。
+    打分判定，遇到第一个不像版头的段落即停止，保证取到的是开头整块而非散落段落。
+    识别到发文字号之后，只再接受分隔线——否则正文标题可能被误纳入。
+
+    返回 (索引列表, 明细列表)。
+    """
+    picked, detail = [], []
+    got_number = False
+    for i in range(min(len(paras), 6)):
+        text = paras[i]['text'].strip()
+        if not text:
+            if _para_has_border(elements[i]) or _para_has_image(elements[i]):
+                picked.append(i)
+                detail.append({'index': i, 'text': '(分隔线)' if not _para_has_image(elements[i]) else '(红头图片)',
+                               'reason': ('无文字且带段落边框' if not _para_has_image(elements[i])
+                                          else '无文字且含图片（红头常为图片）')})
+                continue
+            if not picked:
+                continue          # 版头之前的空行，跳过
+            break
+        if got_number:
+            break                 # 文号之后只剩分隔线，有文字就该是标题了
+
+        score, reasons = 0, []
+        if _para_is_red(elements[i]):
+            score += 2
+            reasons.append('红色文字')
+        if _para_max_size(elements[i]) >= 22:
+            score += 1
+            reasons.append('字号≥二号')
+        if DOC_NUMBER.match(text):
+            score += 3
+            reasons.append('发文字号格式')
+            got_number = True
+        if text.endswith('文件') and i <= 2:
+            score += 2
+            reasons.append('以"文件"结尾')
+        if score >= 2:
+            picked.append(i)
+            detail.append({'index': i, 'text': text, 'reason': '、'.join(reasons)})
+            continue
+        break
+    return picked, detail
+
+
 def build(path):
     doc = Document(path)
 
@@ -399,6 +485,7 @@ def build(path):
             flow.append(('t', Table(child, doc)))
 
     paras = []
+    elements = []
     tables = []
     auto_numbered = []
     # 占位：body 中记录 ('para', sig) / ('table', index)
@@ -413,6 +500,7 @@ def build(path):
             prefix, info = resolve_auto_number(obj, num_defs, counters, last_values)
             sig = para_signals(obj, len(paras), prefix, info)
             paras.append(sig)
+            elements.append(obj._element)
             if info:
                 auto_numbered.append({'index': sig['index'], 'text': info['text'],
                                       'fmt': info['fmt'], 'value': info['value'],
@@ -429,9 +517,15 @@ def build(path):
 
     # ── 结构性要素 ──────────────────────────────────────────
     # 标题、署名、成文日期由生成器单独输出，留在 body 里会出现两次。
-    # 标题取**首个非空段落**：公文标题上方常有空行或文号行，写死首段会取到空串，
-    # 还会把真正的标题当正文排一遍。
-    title_idx = next((i for i, s in enumerate(paras) if s['text'].strip()), None)
+    # 版头（红头 / 发文字号 / 分隔线）不属于正文，识别出来原样保留，不参与重排。
+    # 不识别的话红头会被当成标题排成二号小标宋，真正的标题反而沦为正文段落。
+    head_idx, head_detail = detect_letterhead(paras, elements)
+    head_set = set(head_idx)
+
+    # 标题取**首个非空且非版头**的段落：公文标题上方常有空行或文号行，
+    # 写死首段会取到空串或红头，还会把真正的标题当正文排一遍。
+    title_idx = next((i for i, s in enumerate(paras)
+                      if s['text'].strip() and i not in head_set), None)
 
     # 成文日期：整段仅为「2026年3月17日」时几乎必然是落款日期
     date_idx = None
@@ -450,6 +544,7 @@ def build(path):
                 sig_idx = j
             break
     dropped = {i for i in (title_idx, sig_idx, date_idx) if i is not None}
+    dropped |= head_set
     # 落款块前后的空段落一并清掉：源文件里那些用来把落款"顶下去"的空行，
     # 生成器会在落款前后各补一个空行，留着就是一堆空段落噪音
     anchor = sig_idx if sig_idx is not None else date_idx
@@ -523,7 +618,9 @@ def build(path):
                   'page_number 由源文档页码自动推断：'
                   '源文件无页码→none，有→沿用 center/odd_even。'
                   '标题取首个非空段落；落款署名与成文日期已从 body 剥离'
-                  '（见 signature / date / _stripped），避免重复输出。'),
+                  '（见 signature / date / _stripped），避免重复输出。'
+                  '版头（红头/发文字号/分隔线）不参与重排，由 header 记录'
+                  '并原样复制到新文档——不要替用户重做红头。'),
     }
     if sig_idx is not None:
         result['signature'] = paras[sig_idx]['text'].strip()
@@ -536,6 +633,13 @@ def build(path):
                              'text': paras[i]['text'].strip()})
     if stripped:
         result['_stripped'] = stripped
+    if head_idx:
+        result['header'] = {
+            'source': os.path.abspath(path),
+            'indices': head_idx,
+            'texts': [paras[i]['text'].strip() for i in head_idx],
+        }
+        result['_head_detail'] = head_detail
     if candidates:
         result['_candidates'] = candidates
     if pn['detail']:
@@ -596,6 +700,13 @@ def main():
             print(f'候选要素 {len(cand)} 处（误判代价高，未自动剥离，请确认）：')
             for c in cand:
                 print(f"   第{c['index']}段 → {c['field']}：{c['text'][:30]}")
+        head = result.get('header')
+        if head:
+            print(f"版头：检测到 {len(head['indices'])} 段（红头/发文字号/分隔线）"
+                  f" → 原样保留，不参与重排；明细见 _head_detail")
+            for t in head['texts']:
+                if t:
+                    print(f'   {t}')
         tabs = result.get('tables') or []
         if tabs:
             merged = sum(1 for t in tabs if t.get('spans'))
