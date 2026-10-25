@@ -15,7 +15,7 @@ examples_en:
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
   - "Reformat this request with an attached table, keeping the original page numbering"
-version: 1.8.0
+version: 1.9.0
 author: songdianda
 ---
 
@@ -160,6 +160,15 @@ python3 scripts/generate_gongwen.py --check-fonts
 - 识别到发文字号之后只再接受分隔线，避免把正文标题误纳入
 
 **识别不出、或源文件根本没有版头时，不凭空生成一个**——那需要套用单位红头模板。
+
+**版头字体：连文档默认字体一起保留。** 红头段落若没有逐字设字体，它显示的是
+源文档的**文档级默认字体**（`docDefaults`）。生成器会把源文档的默认字体同步到新文档，
+否则这些段落会掉回新模板的主题字体，表现为"红头换了张脸"。
+正文、页码、表格均由脚本显式设字体，不受此项影响。
+
+版头**不做字体回退**：本机缺字体时保留原字体名由 Word 替换，只在输出里提示缺哪个字体。
+这与正文策略不同（正文缺国标字体时回退到本机等效字体），
+所以同一份文档里红头与正文可能不是同一张字体——这是有意为之，不是缺陷。
 
 ### 不生成的要素
 

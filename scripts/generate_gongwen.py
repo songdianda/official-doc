@@ -23,6 +23,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Mm, Pt
+from lxml import etree
 
 # ── 排版常量（依据 GB/T 9704-2012） ──────────────────────
 
@@ -322,6 +323,155 @@ def _rebuild_images(src_doc, dst_doc, new_p):
         rebuild(rid, lambda v, e=imagedata: e.set(qn('r:id'), v))
 
 
+def _theme_font_map(src_doc):
+    """解析源文档 theme 部件的 major/minor 字体名。
+
+    返回 {'majorHAnsi': 'Calibri', 'minorEastAsia': '宋体', ...}。
+    文档默认字体常写成主题引用（如 w:eastAsiaTheme="minorEastAsia"），
+    不解析出真实字体名就无法在新文档里还原。
+    """
+    out = {}
+    root = None
+    try:
+        for part in src_doc.part.package.iter_parts():
+            if 'theme' in str(part.partname):
+                root = etree.fromstring(part.blob)
+                break
+    except Exception:
+        return out
+    if root is None:
+        return out
+    A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    for scheme, prefix in (('majorFont', 'major'), ('minorFont', 'minor')):
+        node = root.find('{{{a}}}themeElements/{{{a}}}fontScheme/{{{a}}}{s}'
+                         .format(a=A, s=scheme))
+        if node is None:
+            continue
+        for tag, suffix in (('latin', 'HAnsi'), ('ea', 'EastAsia'), ('cs', 'Bidi')):
+            el = node.find('{{{a}}}{t}'.format(a=A, t=tag))
+            if el is not None:
+                out[prefix + suffix] = el.get('typeface') or ''
+    return out
+
+
+def _resolve_default_fonts(src_doc, fonts_el):
+    """把文档默认字体（w:rFonts）里的主题引用解析成真实字体名。
+
+    返回 {'ascii': ..., 'hAnsi': ..., 'eastAsia': ..., 'cs': ...}，
+    只含解析成功的键。
+    """
+    attrs = {}
+    for w, key in (('w:ascii', 'ascii'), ('w:hAnsi', 'hAnsi'),
+                   ('w:eastAsia', 'eastAsia'), ('w:cs', 'cs')):
+        v = fonts_el.get(qn(w))
+        if v:
+            attrs[key] = v
+    theme = None
+    for w, key in (('w:asciiTheme', 'ascii'), ('w:hAnsiTheme', 'hAnsi'),
+                   ('w:eastAsiaTheme', 'eastAsia'), ('w:cstheme', 'cs')):
+        v = fonts_el.get(qn(w))
+        if not v or key in attrs:
+            continue
+        if theme is None:
+            theme = _theme_font_map(src_doc)
+        # v 形如 minorEastAsia / majorHAnsi；取不到时按默认档位兜底
+        name = theme.get(v) or theme.get(
+            'minor' + ('EastAsia' if key == 'eastAsia' else 'HAnsi'), '')
+        if name:
+            attrs[key] = name
+    return attrs
+
+
+def sync_doc_defaults(src_doc, dst_doc):
+    """把源文档的文档级默认字体（docDefaults）同步到新文档。
+
+    源文档里没有显式设字体的 run（红头常常如此——靠样式或文档默认显示），
+    在源文档中由 docDefaults 兜底。新建文档的 docDefaults 是 python-docx
+    模板的主题引用，与源文档不同，这些 run 复制过来就会换字体。
+
+    正文、页码、表格都由本脚本显式设字体，不受此项影响。
+    """
+    def _rpr_defaults(d):
+        styles = d.styles.element
+        dd = styles.find(qn('w:docDefaults'))
+        if dd is None:
+            return None
+        rpd = dd.find(qn('w:rPrDefault'))
+        return rpd.find(qn('w:rPr')) if rpd is not None else None
+
+    src_rpr = _rpr_defaults(src_doc)
+    dst_rpr = _rpr_defaults(dst_doc)
+    if src_rpr is None or dst_rpr is None:
+        return None
+    src_fonts = src_rpr.find(qn('w:rFonts'))
+    if src_fonts is None:
+        return None
+
+    resolved = _resolve_default_fonts(src_doc, src_fonts)
+    if not resolved:
+        return None
+
+    dst_fonts = dst_rpr.find(qn('w:rFonts'))
+    if dst_fonts is None:
+        dst_fonts = OxmlElement('w:rFonts')
+        dst_rpr.insert(0, dst_fonts)
+    # 具体字体名与主题引用不能并存，先清主题引用
+    for a in ('w:asciiTheme', 'w:hAnsiTheme', 'w:eastAsiaTheme', 'w:cstheme'):
+        dst_fonts.attrib.pop(qn(a), None)
+    for key, val in resolved.items():
+        dst_fonts.set(qn('w:' + key), val)
+
+    # 语言标记影响中文的断行与字体选择，一并同步
+    src_lang = src_rpr.find(qn('w:lang'))
+    if src_lang is not None:
+        dst_lang = dst_rpr.find(qn('w:lang'))
+        if dst_lang is None:
+            dst_lang = OxmlElement('w:lang')
+            dst_rpr.append(dst_lang)
+        for a in ('w:eastAsia', 'w:val', 'w:bidi'):
+            v = src_lang.get(qn(a))
+            if v:
+                dst_lang.set(qn(a), v)
+    return resolved
+
+
+def _letterhead_fonts(src_doc, indices):
+    """列出版头段落实际用到的字体名（含未显式设置时的文档默认字体）。"""
+    fonts = []
+    seen = set()
+
+    def _add(name):
+        if name and name not in seen:
+            seen.add(name)
+            fonts.append(name)
+
+    elements = [p._element for p in src_doc.paragraphs]
+    for i in indices:
+        if i >= len(elements):
+            continue
+        for run in elements[i].iter(qn('w:r')):
+            rPr = run.find(qn('w:rPr'))
+            if rPr is None:
+                continue
+            rf = rPr.find(qn('w:rFonts'))
+            if rf is None:
+                continue
+            for a in ('w:eastAsia', 'w:ascii', 'w:hAnsi'):
+                _add(rf.get(qn(a)))
+    # 未显式设字体的 run 会用文档默认字体，也算版头实际字体
+    src_rpr = src_doc.styles.element.find(qn('w:docDefaults'))
+    if src_rpr is not None:
+        rpd = src_rpr.find(qn('w:rPrDefault'))
+        if rpd is not None:
+            rpr = rpd.find(qn('w:rPr'))
+            if rpr is not None:
+                rf = rpr.find(qn('w:rFonts'))
+                if rf is not None:
+                    for name in _resolve_default_fonts(src_doc, rf).values():
+                        _add(name)
+    return fonts
+
+
 def copy_letterhead(doc, spec):
     """把源文档的版头（红头 / 发文字号 / 分隔线）原样复制到新文档开头。
 
@@ -339,6 +489,14 @@ def copy_letterhead(doc, spec):
         return 0
 
     src = Document(src_path)
+
+    # 先同步文档默认字体：版头里没显式设字体的 run 靠它兜底，
+    # 不复制过来就会在新文档里换成别的字体（表现为"红头变样"）。
+    defaults = sync_doc_defaults(src, doc)
+    if defaults:
+        print(f'✓ 已沿用源文档默认字体：'
+              + '，'.join(f'{k}={v}' for k, v in defaults.items()))
+
     elements = [p._element for p in src.paragraphs]
     body = doc.element.body
     sectPr = body.find(qn('w:sectPr'))
@@ -354,7 +512,30 @@ def copy_letterhead(doc, spec):
         else:
             body.append(new_p)
         copied += 1
+
+    if copied:
+        _report_letterhead_fonts(src, indices)
     return copied
+
+
+def _report_letterhead_fonts(src_doc, indices):
+    """提示版头用到的字体在本机是否齐全。
+
+    版头按用户要求原样保留、不做字体回退，所以本机缺字体时由 Word 自行替换，
+    可能和正文（走回退链）不是同一张字体。只提示、不擅自改。
+    """
+    names = _letterhead_fonts(src_doc, indices)
+    if not names:
+        return
+    avail = available_fonts()
+    if not avail:
+        return                      # 探测失败就不猜，避免误报
+    missing = [n for n in names if n not in avail]
+    if missing:
+        print('↷ 版头字体本机未安装（已原样保留字体名，由 Word 替换显示）：'
+              + '、'.join(missing))
+        print('    如需与正文统一，可在源文件中把红头改为本机已有的字体，'
+              '或安装对应字体')
 
 
 def _row_width(row, srow):
