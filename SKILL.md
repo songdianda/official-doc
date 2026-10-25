@@ -2,9 +2,9 @@
 name: official-doc
 display_name: 公文格式排版
 display_name_en: Official Document Formatter
-description: 依据 GB/T 9704-2012 党政机关公文格式国标，把内容或现有 docx 重排为标准公文，源文件带红头与发文字号时原样保留、只重排正文，保留编号与表格，自动检查结构层次编号错误
-description_zh: 按党政机关公文格式国标(GB/T 9704-2012)把内容或现有 Word 重排为标准 DOCX 公文；源文件带红头、发文字号时原样保留、只重排正文，保留编号与表格（含合并单元格），自动检查并修正"一、（一）1.（1）①"层级编号错误
-description_en: Reformat content or an existing Word file into a standard Chinese official DOCX per GB/T 9704-2012; keeps existing letterhead and document number intact, preserving numbering and tables, with automatic structural numbering checks
+description: 依据 GB/T 9704-2012 党政机关公文格式国标，把内容或现有 docx 重排为标准公文，源文件带红头与发文字号时原样保留、只重排正文，保留编号与表格，自动检查结构层次编号错误。触发词：公文排版、公文格式、重排公文、红头、发文字号、编号层级检查、GB/T 9704
+description_zh: 按党政机关公文格式国标(GB/T 9704-2012)把内容或现有 Word 重排为标准 DOCX 公文；源文件带红头、发文字号时原样保留、只重排正文，保留编号与表格（含合并单元格），自动检查并修正"一、（一）1.（1）①"层级编号错误。触发词：公文排版、公文格式、重排公文、红头、发文字号、编号层级检查、GB/T 9704
+description_en: "Reformat content or an existing Word file into a standard Chinese official DOCX per GB/T 9704-2012; keeps existing letterhead and document number intact, preserving numbering and tables, with automatic structural numbering checks. Triggers - official document formatting, GB/T 9704, letterhead, document number, heading hierarchy check"
 examples_zh:
   - "把这份会议纪要按公文格式排版成 Word"
   - "帮我检查这份公文的编号层级有没有错"
@@ -15,8 +15,9 @@ examples_en:
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
   - "Reformat this request with an attached table, keeping the original page numbering"
-version: 1.9.0
+version: 1.9.1
 author: songdianda
+user-invocable: true
 ---
 
 # 公文格式排版（GB/T 9704-2012）
@@ -37,9 +38,9 @@ author: songdianda
    - 依据优先级：Word 的 `outlineLvl`/标题样式 > 上下文结构 > 是否成句 > 原文加粗（**加粗仅作弱参考，原格式可能有误**）。
    - **不用字数阈值**判断。
    - 拿不准时默认按 `numbered_body`（保留编号、不加粗），并把疑问集中列表请用户确认。
-   - **不自动改动编号**；编号错误只在用户要求时按 `numbering-rules.md` 修正并单独报告。
+   - **不自动改动编号**；编号错误只在用户要求时按 `references/numbering-rules.md` 修正并单独报告。
 3. **编号检查**：对照 `references/numbering-rules.md` 检查跳层、跳号、半角括号等。有问题用表格列出「段落位置 / 原文编号 / 问题 / 修正为」，征询后再改。**不擅自改动用户原意。**
-   - **先确认自动编号**：Word 自动编号不在 `p.text` 里，`inspect_docx.py` 会从 `numbering.xml` 算出并补回（结果见 `_auto_number`）。若发现源文档混用了手打编号与自动编号，交付时明确说明——这是最容易"看起来少了一级"的坑。
+   - **先确认自动编号**：Word 自动编号不在 `p.text` 里，`scripts/inspect_docx.py` 会从 `numbering.xml` 算出并补回（结果见 `_auto_number`）。若发现源文档混用了手打编号与自动编号，交付时明确说明——这是最容易"看起来少了一级"的坑。
 4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、输出路径。用户未提供的项目逐项询问，**不编造**。
    - **页码不在此列**：有源文件时以源文件为准（无页码就不加），无源文件时默认居中，交付时说明采用的值。
 5. **生成文件**：调用 `scripts/generate_gongwen.py`，格式参数见 `references/format-spec.md`。
@@ -102,7 +103,7 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 **源文档没有页码，就不要替它加。** 排版是重排格式，不是替用户决定要不要页码——单页文件、内部传阅件常刻意不编页码，凭空加出来是越权。
 
-- 用 `inspect_docx.py` 处理现有 docx 时，脚本**自动检测**并写入 `page_number`：
+- 用 `scripts/inspect_docx.py` 处理现有 docx 时，脚本**自动检测**并写入 `page_number`：
   - 源文档无页码 → `none`
   - 有页码 → 沿用其原样式（居中→`center`；奇偶页不同→`odd_even`）
 - 由纯文本新建公文（无源文件可参照）时**默认 `center` 居中**，交付时说明。
@@ -112,7 +113,7 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 `type` 取值：`heading1`~`heading5`、`body`、`numbered_body`、`blank`、`table`。
 
-**附表**：`inspect_docx.py` 会把源文档表格提取到 `tables`，并在 `body` 对应位置插 `{"type":"table","index":0}`。
+**附表**：`scripts/inspect_docx.py` 会把源文档表格提取到 `tables`，并在 `body` 对应位置插 `{"type":"table","index":0}`。
 排版为居中 + 全线边框 + 表头 12 磅加粗 + 数据 10.5 磅。**表格数据必须与原文逐格一致，不得改动数值。**
 其中 **`numbered_body`** 表示"带编号的工作事项"——保留编号、按正文排版、**不加粗**。
 工作总结/汇报中「1. 完成了……」这类罗列几乎都是它，误判成 `heading3` 会导致整段被加粗。
@@ -149,7 +150,7 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 **源文件带红头和发文字号时，一律原样保留，不参与重排。** 红头是各单位的门面，替用户重排等于改他的门面。
 
-`inspect_docx.py` 会自动识别文档开头的红头、发文字号、红色分隔线（文字或图片都可），
+`scripts/inspect_docx.py` 会自动识别文档开头的红头、发文字号、红色分隔线（文字或图片都可），
 记录到 `header`，由生成器**整段原样复制**到新文档开头——字体、颜色、字号、对齐、边框全保留。
 
 识别规则（详见 `references/format-spec.md` 第 8 节）：

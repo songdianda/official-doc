@@ -38,7 +38,7 @@ python-docx 的 `p.text` 只取 `w:t`，**取不到自动编号**——直接提
 
 结果是「一、」在、「二、」没了，看起来像"少了一级"。
 
-**处理办法**：`inspect_docx.py` 会自动解析 `numbering.xml`，算出每段应显示的编号并补回文本：
+**处理办法**：`scripts/inspect_docx.py` 会自动解析 `numbering.xml`，算出每段应显示的编号并补回文本：
 
 - 解析 `numId → abstractNumId → (numFmt, lvlText, start)`，支持 `startOverride`
 - 按 `(numId, ilvl)` 分组计数，序号 = `start + 出现次序 - 1`

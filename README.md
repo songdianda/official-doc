@@ -290,6 +290,23 @@ official-doc/
 
 ---
 
+## 打包发布（维护者）
+
+技能包体积上限为 3MB。**打包前必须排除 `.git`**——官方 `package_skill.py`
+不会自动排除，若直接在 git 仓库目录上执行，会把整个 `.git` 打进包里
+（本仓库 `.git` 约 8MB，直接超限）：
+
+```bash
+# 推荐：手工打包并排除版本库与缓存
+zip -qr official-doc.zip official-doc \
+    -x "*.git*" "*.DS_Store" "*__pycache__*" "*/outputs/*"
+```
+
+打完按 `official-doc.zip` 命名（与技能目录同名），并确认包内结构为
+`official-doc/SKILL.md`、`official-doc/scripts/`、`official-doc/references/`。
+
+---
+
 ## 许可证
 
 [MIT](LICENSE)

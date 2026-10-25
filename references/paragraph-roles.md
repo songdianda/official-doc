@@ -68,14 +68,14 @@
 ## 不自动改动编号
 
 编号属于原文内容。脚本**不得**改写、补全、重排序号。
-编号格式错误（如 `1、` 应为 `1.`）只在用户明确要求时按 `numbering-rules.md` 修正，并单独报告。
+编号格式错误（如 `1、` 应为 `1.`）只在用户明确要求时按 `references/numbering-rules.md` 修正，并单独报告。
 
 ## 结构性要素的处理
 
 标题、主送机关、落款署名、成文日期、附件说明由生成器单独输出。
 若原样留在 `body` 里，会与生成器的输出**重复一遍**。
 
-`inspect_docx.py` 按"误判代价"分两级处理：
+`scripts/inspect_docx.py` 按"误判代价"分两级处理：
 
 | 要素 | 处理 | 理由 |
 |------|------|------|
@@ -98,4 +98,4 @@ python3 scripts/inspect_docx.py 原文.docx -o content.json
 python3 scripts/generate_gongwen.py --config content.json --output 公文.docx
 ```
 
-第 2 步不可省略——`inspect_docx.py` 给的是**建议**，最终判断在人。
+第 2 步不可省略——`scripts/inspect_docx.py` 给的是**建议**，最终判断在人。
