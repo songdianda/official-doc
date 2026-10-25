@@ -113,6 +113,59 @@ def suggest(sig):
     return 'body', 'high', '无编号，普通正文'
 
 
+def detect_page_number(doc):
+    """检测源文档是否已有页码。
+
+    返回 {'found': bool, 'mode': 'center'|'odd_even'|'none', 'detail': [...]}
+
+    规则（重要）：**源文档没页码就不给加**。排版是重排格式，不是替用户
+    决定要不要页码——单页文件、内部传阅件常刻意不编页码，凭空加出来是
+    越权。源文档有页码时，沿用其原有样式（居中 / 奇偶页不同）。
+    """
+    detail = []
+    found = False
+    has_even = False
+
+    settings = doc.settings.element
+    odd_even_on = settings.find(qn('w:evenAndOddHeaders')) is not None
+
+    for si, section in enumerate(doc.sections):
+        for tag in ('w:footerReference', 'w:headerReference'):
+            for ref in section._sectPr.findall(qn(tag)):
+                rid = ref.get(qn('r:id'))
+                if rid is None or rid not in section.part.related_parts:
+                    continue
+                part = section.part.related_parts[rid]
+                instr = ' '.join(e.text or ''
+                                 for e in part.element.iter(qn('w:instrText')))
+                # 用 token 匹配，避免 NUMPAGES / SECTIONPAGES 被当成 PAGE
+                tokens = re.findall(r'[A-Za-z]+', instr.upper())
+                text = ''.join(t.text or ''
+                               for t in part.element.iter(qn('w:t')))
+                is_page = 'PAGE' in tokens
+                # 兜底：页脚里写死的纯数字（无域代码）也算页码
+                if not is_page and text.strip('—-－  \t'):
+                    is_page = bool(re.fullmatch(r'[0-9]{1,4}', text.strip('—-－ ')))
+                if not is_page:
+                    continue
+                found = True
+                ftype = ref.get(qn('w:type'))
+                if ftype == 'even':
+                    has_even = True
+                detail.append({
+                    'section': si,
+                    'location': 'footer' if tag.startswith('w:footer') else 'header',
+                    'type': ftype,
+                    'field': instr.strip() or '(无域，文本页码)',
+                    'text': text,
+                })
+
+    if not found:
+        return {'found': False, 'mode': 'none', 'detail': []}
+    mode = 'odd_even' if (has_even and odd_even_on) else 'center'
+    return {'found': True, 'mode': mode, 'detail': detail}
+
+
 def build(path):
     doc = Document(path)
 
@@ -169,14 +222,23 @@ def build(path):
                               'suggested': role, 'reason': reason})
 
     title = paras[0]['text'] if paras and paras[0]['text'] else ''
+
+    # 页码：源文档没有就不加，有则沿用原样式
+    pn = detect_page_number(doc)
+
     result = {
         'title': title,
+        'page_number': pn['mode'],
         'body': body,
         '_uncertain': uncertain,
         '_note': ('_src 与 _uncertain 为判读线索，可删除；'
                   'type 定稿后交给 generate_gongwen.py。'
-                  '表格保留在 tables，body 中的 {"type":"table"} 决定其位置。'),
+                  '表格保留在 tables，body 中的 {"type":"table"} 决定其位置。'
+                  'page_number 由源文档页码自动推断：'
+                  '源文件无页码→none，有→沿用 center/odd_even。'),
     }
+    if pn['detail']:
+        result['_page_number'] = pn['detail']
     if tables:
         result['tables'] = tables
     return result
@@ -211,6 +273,11 @@ def main():
         u = len(result['_uncertain'])
         print(f'已提取 {n} 段 → {args.output}')
         print(f'其中 {u} 段存疑，请审阅 _uncertain 列表后确认 type')
+        mode = result['page_number']
+        if mode == 'none':
+            print('页码：源文件未发现页码 → 设为 none（不添加页码）')
+        else:
+            print(f'页码：源文件已有页码 → 沿用 {mode}')
     else:
         print(text)
     return 0

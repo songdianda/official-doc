@@ -13,7 +13,7 @@ examples_en:
   - "Format this meeting minutes into a standard official Word document"
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
-version: 1.4.0
+version: 1.5.0
 author: songdianda
 ---
 
@@ -27,7 +27,7 @@ author: songdianda
 
 ## 工作流程
 
-1. **获取内容**：用户提供 `.docx` 路径时，用 `scripts/inspect_docx.py` 提取全文、样式线索与角色建议；直接给文本时跳过此步。
+1. **获取内容**：用户提供 `.docx` 路径时，用 `scripts/inspect_docx.py` 提取全文、样式线索与角色建议，**并自动检测源文档是否已有页码**；直接给文本时跳过此步。
 2. **判定段落角色**（关键）：逐段确定是标题还是编号正文，规则见 `references/paragraph-roles.md`。
    - 「1.」既可能是三级标题，也可能只是一条编号的工作事项，**不能只看编号**。
    - 依据优先级：Word 的 `outlineLvl`/标题样式 > 上下文结构 > 是否成句 > 原文加粗（**加粗仅作弱参考，原格式可能有误**）。
@@ -35,8 +35,8 @@ author: songdianda
    - 拿不准时默认按 `numbered_body`（保留编号、不加粗），并把疑问集中列表请用户确认。
    - **不自动改动编号**；编号错误只在用户要求时按 `numbering-rules.md` 修正并单独报告。
 3. **编号检查**：对照 `references/numbering-rules.md` 检查跳层、跳号、半角括号等。有问题用表格列出「段落位置 / 原文编号 / 问题 / 修正为」，征询后再改。**不擅自改动用户原意。**
-4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、**页码样式**、输出路径。用户未提供的项目逐项询问，**不编造**。
-   - 页码样式需主动询问：`center` 居中 / `odd_even` 奇偶页不同 / `none` 不显示。用户未指定时**默认 `center` 居中**，并在交付时说明。
+4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、输出路径。用户未提供的项目逐项询问，**不编造**。
+   - **页码不在此列**：有源文件时以源文件为准（无页码就不加），无源文件时默认居中，交付时说明采用的值。
 5. **生成文件**：调用 `scripts/generate_gongwen.py`，格式参数见 `references/format-spec.md`。
 6. **交付**：告知输出路径、实际使用的字体（字体回退情况），以及存疑段落的处理结果。
 
@@ -86,12 +86,21 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 | 取值 | 效果 |
 |------|------|
-| `center`（默认） | 页码**居中** |
+| `center` | 页码**居中** |
 | `odd_even` | 单页居右空一字、双页居左空一字（GB/T 9704-2012 7.5） |
 | `none` | 不显示页码 |
 
-默认居中：7.5 的左右错位是为**双面装订**设计的，单面打印或电子传阅时页码忽左忽右反而凌乱。
-**确认要素阶段应主动问一句页码样式**，用户未指定则按居中生成。命令行可用 `--page-number center|odd_even|none` 覆盖。
+### 页码判定规则（重要）
+
+**源文档没有页码，就不要替它加。** 排版是重排格式，不是替用户决定要不要页码——单页文件、内部传阅件常刻意不编页码，凭空加出来是越权。
+
+- 用 `inspect_docx.py` 处理现有 docx 时，脚本**自动检测**并写入 `page_number`：
+  - 源文档无页码 → `none`
+  - 有页码 → 沿用其原样式（居中→`center`；奇偶页不同→`odd_even`）
+- 由纯文本新建公文（无源文件可参照）时**默认 `center` 居中**，交付时说明。
+- `--page-number center|odd_even|none` 可覆盖上述推断。
+
+居中 vs 奇偶页：7.5 的左右错位是为**双面装订**设计的——翻开书时页码靠外侧才好看。单面打印或电子传阅时页码忽左忽右反而凌乱。
 
 `type` 取值：`heading1`~`heading5`、`body`、`numbered_body`、`blank`、`table`。
 
