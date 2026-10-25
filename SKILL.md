@@ -13,7 +13,7 @@ examples_en:
   - "Format this meeting minutes into a standard official Word document"
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
-version: 1.2.0
+version: 1.3.0
 author: songdianda
 ---
 
@@ -69,8 +69,10 @@ python3 scripts/generate_gongwen.py --check-fonts
     {"type": "heading1", "text": "一、第一层标题"},
     {"type": "heading2", "text": "（一）第二层标题"},
     {"type": "numbered_body", "text": "1. 完成了……，开展了……。"},
+    {"type": "table", "index": 0},
     {"type": "blank", "text": ""}
   ],
+  "tables": [{"rows": [["列1", "列2"], ["值1", "值2"]], "header": true}],
   "attachments": ["附件名称"],
   "signature": "发文机关署名",
   "date": "2026年3月17日",
@@ -78,7 +80,10 @@ python3 scripts/generate_gongwen.py --check-fonts
 }
 ```
 
-`type` 取值：`heading1`~`heading5`、`body`、`numbered_body`、`blank`。
+`type` 取值：`heading1`~`heading5`、`body`、`numbered_body`、`blank`、`table`。
+
+**附表**：`inspect_docx.py` 会把源文档表格提取到 `tables`，并在 `body` 对应位置插 `{"type":"table","index":0}`。
+排版为居中 + 全线边框 + 表头 12 磅加粗 + 数据 10.5 磅。**表格数据必须与原文逐格一致，不得改动数值。**
 其中 **`numbered_body`** 表示"带编号的工作事项"——保留编号、按正文排版、**不加粗**。
 工作总结/汇报中「1. 完成了……」这类罗列几乎都是它，误判成 `heading3` 会导致整段被加粗。
 

@@ -18,6 +18,7 @@ import re
 import sys
 
 from docx import Document
+from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -289,6 +290,55 @@ def add_blank(doc, line_spacing=LINE_BODY):
     return para
 
 
+def add_table(doc, rows, header=True, font_name=None,
+              size_header=12, size_body=10.5, align='center'):
+    """插入附表。
+
+    国标未对附表字号作强制规定，通行做法是小四（12磅）表头 + 五号（10.5磅）
+    数据，字体随正文用仿宋，整体居中并加边框。数据与表头均居中对齐。
+
+    rows: 二维列表，第一行在 header=True 时视为表头。
+    """
+    font_name = font_name or FONT_BODY
+    if not rows:
+        return None
+    ncol = max(len(r) for r in rows)
+    table = doc.add_table(rows=0, cols=ncol)
+    try:
+        table.style = 'Table Grid'      # 全线边框
+    except KeyError:
+        pass
+    table.alignment = (WD_TABLE_ALIGNMENT.CENTER if align == 'center'
+                       else WD_TABLE_ALIGNMENT.LEFT)
+    table.autofit = True
+
+    align_map = {'left': WD_ALIGN_PARAGRAPH.LEFT,
+                 'center': WD_ALIGN_PARAGRAPH.CENTER,
+                 'right': WD_ALIGN_PARAGRAPH.RIGHT}
+    para_align = align_map.get(align, WD_ALIGN_PARAGRAPH.CENTER)
+
+    for ri, row in enumerate(rows):
+        cells = table.add_row().cells
+        is_header = header and ri == 0
+        size = size_header if is_header else size_body
+        for ci in range(ncol):
+            text = row[ci] if ci < len(row) else ''
+            cell = cells[ci]
+            # 新建单元格自带一个空段落，直接取用即可；
+            # clear_content() 会把这个段落也删掉，导致 paragraphs[0] 越界。
+            para = cell.paragraphs[0]
+            para.alignment = para_align
+            set_line_spacing(para, 16 if is_header else 14)
+            run = para.add_run(str(text))
+            set_font(run, font_name, size, bold=is_header)
+            # 垂直居中
+            tcPr = cell._tc.get_or_add_tcPr()
+            va = OxmlElement('w:vAlign')
+            va.set(qn('w:val'), 'center')
+            tcPr.append(va)
+    return table
+
+
 def detect_level(text):
     """兜底：按编号前缀猜角色，返回角色字符串。无匹配返回 None。
 
@@ -428,8 +478,21 @@ def build_document(content, output_path):
 
     # 正文
     font_by_role = {'hei': FONT_HEI, 'kai': FONT_KAI, 'body': FONT_BODY}
+    tables = content.get('tables') or []
+    used_tables = set()
 
     for item in content.get('body', []):
+        # 表格占位：{"type": "table", "index": 0}
+        if isinstance(item, dict) and item.get('type') == 'table':
+            idx = item.get('index', 0)
+            if idx < len(tables):
+                t = tables[idx]
+                add_table(doc, t.get('rows', []),
+                          header=t.get('header', True),
+                          align=t.get('align', 'center'))
+                used_tables.add(idx)
+            continue
+
         text, role = resolve_role(item)
         if role == 'blank' or not text.strip():
             add_blank(doc)
@@ -469,6 +532,14 @@ def build_document(content, output_path):
         set_right_indent_chars(date_para, 4)   # 成文日期右空四字
         date_run = date_para.add_run(date)
         set_font(date_run, FONT_BODY, SIZE_BODY)
+
+    # 未在 body 中显式定位的表格，追加到文末（落款之后）
+    for idx, t in enumerate(tables):
+        if idx not in used_tables:
+            add_blank(doc)
+            add_table(doc, t.get('rows', []),
+                      header=t.get('header', True),
+                      align=t.get('align', 'center'))
 
     # 页码
     add_page_number(section)

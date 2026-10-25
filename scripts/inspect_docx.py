@@ -115,12 +115,43 @@ def suggest(sig):
 
 def build(path):
     doc = Document(path)
-    paras = [para_signals(p, i) for i, p in enumerate(doc.paragraphs)]
+
+    # 按文档流顺序遍历，否则表格相对段落的位置会丢失
+    from docx.oxml.ns import qn as _qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    flow = []
+    for child in doc.element.body.iterchildren():
+        if child.tag == _qn('w:p'):
+            flow.append(('p', Paragraph(child, doc)))
+        elif child.tag == _qn('w:tbl'):
+            flow.append(('t', Table(child, doc)))
+
+    paras = []
+    tables = []
+    # 占位：body 中记录 ('para', sig) / ('table', index)
+    order = []
+    for kind, obj in flow:
+        if kind == 'p':
+            sig = para_signals(obj, len(paras))
+            paras.append(sig)
+            order.append(('para', len(paras) - 1))
+        else:
+            rows = [[c.text.strip() for c in row.cells] for row in obj.rows]
+            tables.append({'rows': rows, 'header': True})
+            order.append(('table', len(tables) - 1))
 
     # 约定：首段为标题，只进 title 字段，不进 body（否则会重复输出一次）
     body = []
     uncertain = []
-    for sig in paras[1:]:
+    for kind, i in order:
+        if kind == 'table':
+            body.append({'type': 'table', 'index': i})
+            continue
+        sig = paras[i]
+        if sig['index'] == 0:
+            continue        # 首段已作 title
         role, conf, reason = suggest(sig)
         item = {'type': role, 'text': sig['text']}
         item['_src'] = {
@@ -138,13 +169,17 @@ def build(path):
                               'suggested': role, 'reason': reason})
 
     title = paras[0]['text'] if paras and paras[0]['text'] else ''
-    return {
+    result = {
         'title': title,
         'body': body,
         '_uncertain': uncertain,
         '_note': ('_src 与 _uncertain 为判读线索，可删除；'
-                  'type 定稿后交给 generate_gongwen.py。'),
+                  'type 定稿后交给 generate_gongwen.py。'
+                  '表格保留在 tables，body 中的 {"type":"table"} 决定其位置。'),
     }
+    if tables:
+        result['tables'] = tables
+    return result
 
 
 def main():
