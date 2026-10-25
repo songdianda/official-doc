@@ -54,13 +54,41 @@ FONT_CHAINS = {
     'page':  ['宋体', '宋体-简', '华文宋体', 'SimSun', 'Songti SC'],
 }
 
-# 层级识别：编号前缀 -> (字体, 是否加粗)
+# ── 段落角色 ─────────────────────────────────────────────
+#
+# 角色由调用方（AI）显式指定，脚本只负责把角色渲染成对应版式，
+# 不根据编号猜语义。因为「1.」既可能是三级标题，也可能只是一条
+# 编号的工作事项——把整段叙述误加粗，比漏加粗难看得多。
+#
+# 推荐在 content.body 中显式写 {"type": "<role>", "text": "..."}。
+
+ROLE_STYLES = {
+    'heading1': ('hei', False),        # 一、      黑体
+    'heading2': ('kai', False),        # （一）    楷体
+    'heading3': ('body', True),        # 1.        仿宋加粗
+    'heading4': ('body', True),        # （1）     仿宋加粗
+    'heading5': ('body', True),        # ①         仿宋加粗
+    'body': ('body', False),           # 普通正文
+    'numbered_body': ('body', False),  # 编号正文：保留编号，按正文排，不加粗
+}
+
+# 旧字段名兼容
+ROLE_ALIASES = {
+    'level1': 'heading1', 'level2': 'heading2', 'level3': 'heading3',
+    'level4': 'heading4', 'level5': 'heading5',
+    'text': 'body', 'para': 'body', 'plain': 'body',
+}
+
+# 兜底自动识别：仅在元素是字符串（未显式指定角色）时使用。
+# 原则：宁可漏判为正文，也不要把整段叙述误加粗。
+#   一、/（一）几乎不会是正文罗列 → 仍按标题
+#   1./（1）/① 常用于罗列工作事项 → 兜底一律按编号正文（不加粗）
 LEVEL_PATTERNS = [
-    (re.compile(r'^[一二三四五六七八九十]+、'), FONT_HEI, False),      # 一、
-    (re.compile(r'^（[一二三四五六七八九十]+）'), FONT_KAI, False),    # （一）
-    (re.compile(r'^\d+\.'), FONT_BODY, True),                        # 1.
-    (re.compile(r'^（\d+）'), FONT_BODY, True),                      # （1）
-    (re.compile(r'^[①-⑳]'), FONT_BODY, True),                        # ①
+    (re.compile(r'^[一二三四五六七八九十]+、'), 'heading1'),
+    (re.compile(r'^（[一二三四五六七八九十]+）'), 'heading2'),
+    (re.compile(r'^\d+\.'), 'numbered_body'),
+    (re.compile(r'^（\d+）'), 'numbered_body'),
+    (re.compile(r'^[①-⑳]'), 'numbered_body'),
 ]
 
 
@@ -130,16 +158,29 @@ def apply_font_fallback():
     FONT_KAI = resolved['kai']
     FONT_HEI = resolved['hei']
     FONT_PAGE = resolved['page']
-
-    # LEVEL_PATTERNS 在模块加载时已固化旧字体名，原地重建
-    LEVEL_PATTERNS[:] = [
-        (re.compile(r'^[一二三四五六七八九十]+、'), FONT_HEI, False),      # 一、
-        (re.compile(r'^（[一二三四五六七八九十]+）'), FONT_KAI, False),    # （一）
-        (re.compile(r'^\d+\.'), FONT_BODY, True),                        # 1.
-        (re.compile(r'^（\d+）'), FONT_BODY, True),                      # （1）
-        (re.compile(r'^[①-⑳]'), FONT_BODY, True),                        # ①
-    ]
     return {r: (before[r], resolved[r]) for r in resolved}
+
+
+def resolve_role(item):
+    """把 body 元素解析为 (文本, 角色)。
+
+    item 可为：
+      {"type": "heading3"|"numbered_body"|"body"|"blank"|..., "text": "..."}
+      或纯字符串（走兜底自动识别）
+    返回 (text, role)；role 为 'blank' 时调用方应插入空行。
+    """
+    if isinstance(item, str):
+        return item, detect_level(item) or 'body'
+
+    text = item.get('text', '')
+    role = item.get('type') or 'body'
+    role = ROLE_ALIASES.get(role, role)
+    if role == 'blank':
+        return text, 'blank'
+    if role not in ROLE_STYLES:
+        # 未知角色：不猜，按最安全的正文处理
+        role = 'body'
+    return text, role
 
 
 # ── 基础排版函数 ─────────────────────────────────────────
@@ -249,11 +290,15 @@ def add_blank(doc, line_spacing=LINE_BODY):
 
 
 def detect_level(text):
-    """按编号前缀识别层级，返回 (字体, 是否加粗)。无匹配返回 None。"""
+    """兜底：按编号前缀猜角色，返回角色字符串。无匹配返回 None。
+
+    只在元素是字符串（未显式指定 type）时调用。猜不出语义，
+    偏向安全侧：阿拉伯数字编号一律按编号正文，不加粗。
+    """
     stripped = text.strip()
-    for pattern, font, bold in LEVEL_PATTERNS:
+    for pattern, role in LEVEL_PATTERNS:
         if pattern.match(stripped):
-            return font, bold
+            return role
     return None
 
 
@@ -382,28 +427,15 @@ def build_document(content, output_path):
         set_font(rec_run, FONT_BODY, SIZE_BODY)
 
     # 正文
+    font_by_role = {'hei': FONT_HEI, 'kai': FONT_KAI, 'body': FONT_BODY}
+
     for item in content.get('body', []):
-        if isinstance(item, str):
-            text = item
-            level = detect_level(text)
-            font, bold = level if level else (FONT_BODY, False)
-        else:
-            text = item.get('text', '')
-            ltype = item.get('type', 'text')
-            if ltype == 'blank':
-                add_blank(doc)
-                continue
-            font, bold = {
-                'level1': (FONT_HEI, False),
-                'level2': (FONT_KAI, False),
-                'level3': (FONT_BODY, True),
-                'level4': (FONT_BODY, True),
-                'level5': (FONT_BODY, True),
-            }.get(ltype, (FONT_BODY, False))
-        if not text.strip():
+        text, role = resolve_role(item)
+        if role == 'blank' or not text.strip():
             add_blank(doc)
             continue
-        add_paragraph(doc, text, font_name=font, bold=bold)
+        font_role, bold = ROLE_STYLES[role]
+        add_paragraph(doc, text, font_name=font_by_role[font_role], bold=bold)
 
     # 附件说明（7.3.4）
     attachments = content.get('attachments') or []

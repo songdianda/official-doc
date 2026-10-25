@@ -13,7 +13,7 @@ examples_en:
   - "Format this meeting minutes into a standard official Word document"
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
-version: 1.1.0
+version: 1.2.0
 author: songdianda
 ---
 
@@ -27,11 +27,17 @@ author: songdianda
 
 ## 工作流程
 
-1. **获取内容**：用户提供 `.docx` 路径时，先用 python-docx 提取全文并展示确认；直接给文本时跳过此步。
-2. **编号检查**：逐段扫描层级编号，对照 `references/numbering-rules.md`。有问题则用表格列出「段落位置 / 原文编号 / 问题 / 修正为」，并征询用户是否自动修正。**不擅自改动用户原意。**
-3. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、输出路径。用户未提供的项目逐项询问，**不编造**。
-4. **生成文件**：调用 `scripts/generate_gongwen.py`，格式参数见 `references/format-spec.md`。
-5. **交付**：告知输出路径，并提示字体是否安装（未装则格式会走样）。
+1. **获取内容**：用户提供 `.docx` 路径时，用 `scripts/inspect_docx.py` 提取全文、样式线索与角色建议；直接给文本时跳过此步。
+2. **判定段落角色**（关键）：逐段确定是标题还是编号正文，规则见 `references/paragraph-roles.md`。
+   - 「1.」既可能是三级标题，也可能只是一条编号的工作事项，**不能只看编号**。
+   - 依据优先级：Word 的 `outlineLvl`/标题样式 > 上下文结构 > 是否成句 > 原文加粗（**加粗仅作弱参考，原格式可能有误**）。
+   - **不用字数阈值**判断。
+   - 拿不准时默认按 `numbered_body`（保留编号、不加粗），并把疑问集中列表请用户确认。
+   - **不自动改动编号**；编号错误只在用户要求时按 `numbering-rules.md` 修正并单独报告。
+3. **编号检查**：对照 `references/numbering-rules.md` 检查跳层、跳号、半角括号等。有问题用表格列出「段落位置 / 原文编号 / 问题 / 修正为」，征询后再改。**不擅自改动用户原意。**
+4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、输出路径。用户未提供的项目逐项询问，**不编造**。
+5. **生成文件**：调用 `scripts/generate_gongwen.py`，格式参数见 `references/format-spec.md`。
+6. **交付**：告知输出路径、实际使用的字体（字体回退情况），以及存疑段落的处理结果。
 
 ## 调用脚本
 
@@ -39,10 +45,12 @@ author: songdianda
 # 准备依赖（首次）
 pip install python-docx
 
-# 方式一：JSON 配置（推荐，支持附件/署名/日期）
+# 推荐流程：提取 → 定角色 → 渲染
+python3 scripts/inspect_docx.py 原文.docx -o content.json   # 提取 + 角色建议 + 存疑清单
+# （审阅 content.json 的 _uncertain，定稿 type）
 python3 scripts/generate_gongwen.py --config content.json --output 公文.docx
 
-# 方式二：纯文本正文（每行一段，自动识别层级）
+# 直接给文本（无源文件）
 python3 scripts/generate_gongwen.py --title "关于XXX的请示" --recipient "XX厅" \
     --body-file body.txt --signature "XXX办公室" --date "2026年3月17日" --output 公文.docx
 
@@ -50,13 +58,19 @@ python3 scripts/generate_gongwen.py --title "关于XXX的请示" --recipient "XX
 python3 scripts/generate_gongwen.py --check-fonts
 ```
 
-`content.json` 结构：
+`content.json` 结构（**角色必须显式指定**）：
 
 ```json
 {
   "title": "关于XXX的请示",
   "recipient": "XX厅",
-  "body": ["正文段落（自动识别层级）", "一、第一层", "（一）第二层", "1. 第三层"],
+  "body": [
+    {"type": "body", "text": "总起段落……"},
+    {"type": "heading1", "text": "一、第一层标题"},
+    {"type": "heading2", "text": "（一）第二层标题"},
+    {"type": "numbered_body", "text": "1. 完成了……，开展了……。"},
+    {"type": "blank", "text": ""}
+  ],
   "attachments": ["附件名称"],
   "signature": "发文机关署名",
   "date": "2026年3月17日",
@@ -64,7 +78,11 @@ python3 scripts/generate_gongwen.py --check-fonts
 }
 ```
 
-`body` 元素也可写作 `{"type": "level1"|"level2"|"level3"|"level4"|"level5"|"text"|"blank", "text": "..."}` 显式指定层级。
+`type` 取值：`heading1`~`heading5`、`body`、`numbered_body`、`blank`。
+其中 **`numbered_body`** 表示"带编号的工作事项"——保留编号、按正文排版、**不加粗**。
+工作总结/汇报中「1. 完成了……」这类罗列几乎都是它，误判成 `heading3` 会导致整段被加粗。
+
+纯字符串元素（不写 `type`）时脚本按保守策略兜底：`一、`/`（一）` 判为标题，`1.`/`（1）`/`①` 一律按编号正文（不加粗）。
 
 ## 关键格式参数
 
@@ -93,6 +111,7 @@ python3 scripts/generate_gongwen.py --check-fonts
 ## 参考
 
 - `references/format-spec.md` —— 完整格式规范（含国标条款号）
+- `references/paragraph-roles.md` —— 段落角色判定规则（标题 vs 编号正文）
 - `references/numbering-rules.md` —— 编号层级检查规则
 - 《党政机关公文格式》GB/T 9704-2012
 - 《党政机关公文处理工作条例》（中办发〔2012〕14号）

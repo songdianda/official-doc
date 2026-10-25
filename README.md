@@ -5,8 +5,9 @@
 ## 功能
 
 - 标准排版：标题、主送机关、正文、附件说明、发文机关署名、成文日期、页码（奇偶页不同）
+- **角色驱动排版**：先定段落角色再渲染，脚本不靠编号猜语义，避免整段误加粗
 - 编号检查：自动识别并校验「一、 →（一）→ 1. →（1）→ ①」五层结构
-- 双输入：JSON 配置，或纯文本正文（自动识别层级）
+- 双输入：JSON 配置，或纯文本正文
 - 零硬编码：标题、主送机关、正文、附件、署名、日期、输出路径全部可传参
 - **字体自动回退**：本机缺少国标字体时，自动选用等效字体，不再让 Word 静默替换
 
@@ -44,10 +45,35 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 在装有国标字体的机器上不会发生任何替换。
 
+## 段落角色（重要）
+
+`"1."` 既可能是三级标题，也可能只是一条编号的工作事项。脚本**不猜语义**，
+由调用方在 `type` 字段显式指定角色：
+
+| type | 含义 | 加粗 |
+|------|------|------|
+| `heading1` ~ `heading5` | 一、/（一）/1./（1）/① 作为**标题** | 三~五层加粗 |
+| `body` | 普通正文（无编号） | 否 |
+| `numbered_body` | **编号正文**：带编号的工作事项，如「1. 完成了……」 | **否** |
+| `blank` | 空行 | — |
+
+工作总结、情况汇报里「1. 完成了……，开展了……」这类罗列几乎都是 `numbered_body`。
+误判成 `heading3` 会导致整段被加粗——**漏加粗只是不够醒目，误加粗是整段噪音**。
+
+纯字符串（不写 `type`）时按保守策略兜底：`一、`/`（一）` 判为标题，
+`1.`/`（1）`/`①` 一律按编号正文（不加粗）。
+
+详见 `references/paragraph-roles.md`。
+
 ## 使用
 
 ```bash
-# JSON 配置
+# 推荐：提取 → 定角色 → 渲染
+python3 scripts/inspect_docx.py 原文.docx -o content.json
+# 审阅 content.json 的 _uncertain 存疑清单，定稿 type
+python3 scripts/generate_gongwen.py --config content.json --output 公文.docx
+
+# 直接生成（已有 content.json）
 python3 scripts/generate_gongwen.py --config content.json --output 公文.docx
 
 # 纯文本正文（每行一段）
@@ -73,9 +99,11 @@ official-doc/
 ├── LICENSE
 ├── references/
 │   ├── format-spec.md            # 完整格式规范（标注国标条款号）
+│   ├── paragraph-roles.md        # 段落角色判定规则（标题 vs 编号正文）
 │   └── numbering-rules.md        # 编号层级检查规则
 └── scripts/
-    └── generate_gongwen.py       # 公文生成器
+    ├── generate_gongwen.py       # 公文生成器（按角色渲染）
+    └── inspect_docx.py           # 提取原文 + 样式线索 + 角色建议 + 存疑清单
 ```
 
 ## 格式速查
