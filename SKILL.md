@@ -13,7 +13,7 @@ examples_en:
   - "Format this meeting minutes into a standard official Word document"
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
-version: 1.5.0
+version: 1.6.0
 author: songdianda
 ---
 
@@ -35,6 +35,7 @@ author: songdianda
    - 拿不准时默认按 `numbered_body`（保留编号、不加粗），并把疑问集中列表请用户确认。
    - **不自动改动编号**；编号错误只在用户要求时按 `numbering-rules.md` 修正并单独报告。
 3. **编号检查**：对照 `references/numbering-rules.md` 检查跳层、跳号、半角括号等。有问题用表格列出「段落位置 / 原文编号 / 问题 / 修正为」，征询后再改。**不擅自改动用户原意。**
+   - **先确认自动编号**：Word 自动编号不在 `p.text` 里，`inspect_docx.py` 会从 `numbering.xml` 算出并补回（结果见 `_auto_number`）。若发现源文档混用了手打编号与自动编号，交付时明确说明——这是最容易"看起来少了一级"的坑。
 4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、输出路径。用户未提供的项目逐项询问，**不编造**。
    - **页码不在此列**：有源文件时以源文件为准（无页码就不加），无源文件时默认居中，交付时说明采用的值。
 5. **生成文件**：调用 `scripts/generate_gongwen.py`，格式参数见 `references/format-spec.md`。

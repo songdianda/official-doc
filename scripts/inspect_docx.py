@@ -38,8 +38,155 @@ STYLE_HEADING = re.compile(r'(?:heading|标题|heading)\s*(\d)', re.I)
 TERMINAL_PUNCT = '。；；！？'
 
 
-def para_signals(p, index):
-    """采集一段的样式线索。"""
+CN_DIGITS = '零一二三四五六七八九十'
+
+
+def cn_number(n):
+    """阿拉伯数字 → 中文数字（1~99），超出返回原数字字符串。"""
+    if n <= 10:
+        return CN_DIGITS[n]
+    if n < 20:
+        return '十' + CN_DIGITS[n - 10]
+    if n < 100:
+        return CN_DIGITS[n // 10] + '十' + (CN_DIGITS[n % 10] if n % 10 else '')
+    if n == 100:
+        return '一百'
+    return str(n)
+
+
+def roman(n):
+    table = [(1000, 'M'), (900, 'CM'), (500, 'D'), (400, 'CD'), (100, 'C'),
+             (90, 'XC'), (50, 'L'), (40, 'XL'), (10, 'X'), (9, 'IX'),
+             (5, 'V'), (4, 'IV'), (1, 'I')]
+    out = ''
+    for v, s in table:
+        while n >= v:
+            out += s
+            n -= v
+    return out or str(n)
+
+
+def format_number(value, fmt):
+    """按 numFmt 渲染序号。bullet / none 返回 None（由调用方取 lvlText 原样）。"""
+    f = (fmt or '').lower()
+    if f in ('bullet', 'none'):
+        return None
+    if f in ('japanesecounting', 'chinesecounting', 'chineselegalsimplified',
+             'ideographdigital', 'ideographtraditional'):
+        return cn_number(value)
+    if f == 'lowerletter':
+        return chr(ord('a') + value - 1) if 1 <= value <= 26 else str(value)
+    if f == 'upperletter':
+        return chr(ord('A') + value - 1) if 1 <= value <= 26 else str(value)
+    if f == 'lowerroman':
+        return roman(value).lower()
+    if f == 'upperroman':
+        return roman(value)
+    return str(value)                      # decimal 等默认阿拉伯数字
+
+
+def load_numbering_defs(doc):
+    """解析 numbering.xml → {numId: {ilvl: {'fmt','lvlText','start'}}}。
+
+    返回空字典表示文档没有自动编号定义。
+    """
+    try:
+        part = doc.part.numbering_part
+    except Exception:
+        return {}
+    if part is None:
+        return {}
+    root = part.element
+
+    abstracts = {}
+    for a in root.iter(qn('w:abstractNum')):
+        aid = a.get(qn('w:abstractNumId'))
+        levels = {}
+        for lvl in a.findall(qn('w:lvl')):
+            fmt_el = lvl.find(qn('w:numFmt'))
+            txt_el = lvl.find(qn('w:lvlText'))
+            st_el = lvl.find(qn('w:start'))
+            levels[lvl.get(qn('w:ilvl'))] = {
+                'fmt': fmt_el.get(qn('w:val')) if fmt_el is not None else 'decimal',
+                'lvlText': txt_el.get(qn('w:val')) if txt_el is not None else '%1.',
+                'start': int(st_el.get(qn('w:val'))) if st_el is not None else 1,
+            }
+        abstracts[aid] = levels
+
+    nums = {}
+    for n in root.iter(qn('w:num')):
+        aid_el = n.find(qn('w:abstractNumId'))
+        levels = dict(abstracts.get(aid_el.get(qn('w:val')), {})
+                      if aid_el is not None else {})
+        for ov in n.findall(qn('w:lvlOverride')):
+            st = ov.find(qn('w:startOverride'))
+            if st is not None:
+                ilvl = ov.get(qn('w:ilvl'))
+                lv = dict(levels.get(ilvl, {}))
+                lv['start'] = int(st.get(qn('w:val')))
+                levels[ilvl] = lv
+        nums[n.get(qn('w:numId'))] = levels
+    return nums
+
+
+def resolve_auto_number(p, defs, counters, last_values):
+    """算出 Word 自动编号在该段应该显示的文本（如「二、」）。
+
+    python-docx 的 p.text 只取 w:t，自动编号不在文本里而挂在 w:numPr 上，
+    直接提取会**整条丢失**——源文件里手打的「一、」在，Word 自动生成的
+    「二、」就没了。
+
+    返回 (显示文本, 线索dict)；无自动编号返回 (None, None)。
+    """
+    if not defs:
+        return None, None
+    pPr = p._element.pPr
+    if pPr is None:
+        return None, None
+    numPr = pPr.find(qn('w:numPr'))
+    if numPr is None:
+        return None, None
+    ilvl_el = numPr.find(qn('w:ilvl'))
+    numid_el = numPr.find(qn('w:numId'))
+    if ilvl_el is None or numid_el is None:
+        return None, None
+    ilvl = ilvl_el.get(qn('w:val'))
+    numid = numid_el.get(qn('w:val'))
+
+    d = defs.get(numid, {}).get(ilvl)
+    if not d:
+        return None, None
+
+    key = (numid, ilvl)
+    if key in counters:
+        counters[key] += 1
+    else:
+        counters[key] = d.get('start', 1)
+    value = counters[key]
+    last_values[key] = value
+
+    rendered = format_number(value, d.get('fmt'))
+    lvl_text = d.get('lvlText', '%1.')
+
+    if rendered is None:                   # 项目符号：原样保留，不编号
+        return lvl_text, {'numId': numid, 'ilvl': ilvl, 'fmt': d.get('fmt'),
+                          'value': value, 'text': lvl_text, 'bullet': True}
+
+    def sub(m):
+        idx = str(int(m.group(1)) - 1)
+        if idx == ilvl:
+            return rendered
+        if (numid, idx) in last_values:    # 多级编号的父层级
+            return str(last_values[(numid, idx)])
+        return str(defs.get(numid, {}).get(idx, {}).get('start', 1))
+
+    text = re.sub(r'%(\d+)', sub, lvl_text)
+    return text, {'numId': numid, 'ilvl': ilvl, 'fmt': d.get('fmt'),
+                  'value': value, 'text': text, 'bullet': False}
+
+
+def para_signals(p, index, auto_prefix=None, auto_info=None):
+    """采集一段的样式线索。auto_prefix 为 Word 自动编号渲染出的文本。"""
     r = p.runs[0] if p.runs else None
     rPr = r._element.rPr if (r is not None) else None
     rFonts = rPr.find(qn('w:rFonts')) if rPr is not None else None
@@ -52,12 +199,13 @@ def para_signals(p, index):
                 outline = int(e.get(qn('w:val')))
             except (TypeError, ValueError):
                 outline = None
-    numPr = None
-    if pPr is not None and pPr.find(qn('w:numPr')) is not None:
-        numPr = True
+    numPr = pPr is not None and pPr.find(qn('w:numPr')) is not None
+    text = p.text.strip()
+    if auto_prefix:
+        text = auto_prefix + text
     return {
         'index': index,
-        'text': p.text.strip(),
+        'text': text,
         'style': p.style.name if p.style is not None else None,
         'styleId': p.style.style_id if p.style is not None else None,
         'outlineLvl': outline,
@@ -65,6 +213,7 @@ def para_signals(p, index):
         'size': (r.font.size.pt if (r is not None and r.font.size) else None),
         'font': (rFonts.get(qn('w:eastAsia')) if rFonts is not None else None),
         'listPara': numPr,          # Word 自动编号/项目符号
+        'autoNumber': auto_info,    # 自动编号线索（由 numbering.xml 算出，非原文字符）
         'alignment': str(p.alignment) if p.alignment is not None else None,
     }
 
@@ -183,12 +332,23 @@ def build(path):
 
     paras = []
     tables = []
+    auto_numbered = []
     # 占位：body 中记录 ('para', sig) / ('table', index)
     order = []
+
+    # Word 自动编号（w:numPr）不在 w:t 里，必须单独解析，否则整条编号丢失
+    num_defs = load_numbering_defs(doc)
+    counters, last_values = {}, {}
+
     for kind, obj in flow:
         if kind == 'p':
-            sig = para_signals(obj, len(paras))
+            prefix, info = resolve_auto_number(obj, num_defs, counters, last_values)
+            sig = para_signals(obj, len(paras), prefix, info)
             paras.append(sig)
+            if info:
+                auto_numbered.append({'index': sig['index'], 'text': info['text'],
+                                      'fmt': info['fmt'], 'value': info['value'],
+                                      'bullet': info['bullet']})
             order.append(('para', len(paras) - 1))
         else:
             rows = [[c.text.strip() for c in row.cells] for row in obj.rows]
@@ -213,6 +373,7 @@ def build(path):
             'outlineLvl': sig['outlineLvl'],
             'bold': sig['bold'],
             'size': sig['size'],
+            'autoNumber': sig.get('autoNumber'),
             'confidence': conf,
             'reason': reason,
         }
@@ -239,6 +400,8 @@ def build(path):
     }
     if pn['detail']:
         result['_page_number'] = pn['detail']
+    if auto_numbered:
+        result['_auto_number'] = auto_numbered
     if tables:
         result['tables'] = tables
     return result
@@ -278,6 +441,12 @@ def main():
             print('页码：源文件未发现页码 → 设为 none（不添加页码）')
         else:
             print(f'页码：源文件已有页码 → 沿用 {mode}')
+        an = result.get('_auto_number') or []
+        if an:
+            print(f'自动编号：{len(an)} 处由 Word 生成（不在原文字符里），已补回文本：')
+            for a in an:
+                print(f'   第{a["index"]}段 → 「{a["text"]}」'
+                      f'（{a["fmt"]}，值={a["value"]}）')
     else:
         print(text)
     return 0
