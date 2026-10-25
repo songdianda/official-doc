@@ -2,9 +2,9 @@
 name: official-doc
 display_name: 公文格式排版
 display_name_en: Official Document Formatter
-description: 依据 GB/T 9704-2012 党政机关公文格式国标生成规范排版的 DOCX 公文，支持从文本或现有 docx 输入，并自动检查结构层次编号错误
-description_zh: 按党政机关公文格式国标(GB/T 9704-2012)把内容重排为标准 DOCX 公文，自动检查并修正"一、（一）1.（1）①"层级编号错误
-description_en: Format Chinese official documents into standard DOCX per GB/T 9704-2012, with automatic structural numbering checks
+description: 依据 GB/T 9704-2012 党政机关公文格式国标，把内容或现有 docx 重排为标准公文，保留编号与表格，自动检查结构层次编号错误；仅排正文部分，不生成红头与版记
+description_zh: 按党政机关公文格式国标(GB/T 9704-2012)把内容或现有 Word 重排为标准 DOCX 公文，保留编号与表格（含合并单元格），自动检查并修正"一、（一）1.（1）①"层级编号错误；仅排正文部分，不生成红头、发文字号与版记
+description_en: Reformat content or an existing Word file into a standard Chinese official DOCX per GB/T 9704-2012, preserving numbering and tables, with automatic structural numbering checks. Body text only - no letterhead, document number or endnotes
 examples_zh:
   - "把这份会议纪要按公文格式排版成 Word"
   - "帮我检查这份公文的编号层级有没有错"
@@ -42,7 +42,9 @@ author: songdianda
 4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、输出路径。用户未提供的项目逐项询问，**不编造**。
    - **页码不在此列**：有源文件时以源文件为准（无页码就不加），无源文件时默认居中，交付时说明采用的值。
 5. **生成文件**：调用 `scripts/generate_gongwen.py`，格式参数见 `references/format-spec.md`。
-6. **交付**：告知输出路径、实际使用的字体（字体回退情况），以及存疑段落的处理结果。
+6. **交付**：告知输出路径、实际使用的字体（字体回退情况）、存疑段落的处理结果，
+   **并主动说明本技能不生成的要素**（红头、发文字号、版记、印章，见「不适用与能力边界」），
+   避免用户误以为拿到的是完整公文。完整说明见 `README.md`。
 
 ## 调用脚本
 
@@ -158,6 +160,7 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 ## 参考
 
+- `README.md` —— **面向使用者的说明**：能做什么 / 不能做什么 / 怎么用 / 常见问题
 - `references/format-spec.md` —— 完整格式规范（含国标条款号）
 - `references/paragraph-roles.md` —— 段落角色判定规则（标题 vs 编号正文）
 - `references/numbering-rules.md` —— 编号层级检查规则
