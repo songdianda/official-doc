@@ -39,6 +39,12 @@ TERMINAL_PUNCT = '。；！？'
 
 # 成文日期（7.3.5.4：阿拉伯数字标全年月日）。整段仅为日期时几乎必然是落款日期。
 DATE_FULL = re.compile(r'^\d{4}年\d{1,2}月\d{1,2}日$')
+# 剥离依据：写出来，才能让使用者判断这次剥离可不可信
+STRIP_REASON = {
+    'date': '整段仅为「YYYY年M月D日」，符合成文日期格式',
+    'signature': '位于成文日期之上最近的非空短段'
+                 '（≤40 字且不以句末标点或顿号结尾）',
+}
 # 附件说明（7.3.4）。
 ATTACH_PREFIX = re.compile(r'^附件[:：]')
 # 发文字号（7.2.4）：机关代字 + 〔年份〕 + 序号，如「X教发〔2026〕15号」
@@ -374,18 +380,28 @@ def suggest(sig):
         role = f'heading{min(level, 5)}'
         return role, 'high', '；'.join(reasons)
 
-    # 2) 无语义标记，看编号 + 句法
+    # 2) 无语义标记，看编号 + 句法。
+    # 句末标点**只是线索，不是判据**：带问号的标题、省略句号的工作事项都真实存在。
+    # 因此带标点时不再给 high，一律要求结合样式与上下文复核。
     if prefix_level:
-        if text.rstrip()[-1] in TERMINAL_PUNCT:
-            return ('numbered_body', 'high',
-                    '以句号结尾的完整叙述句，是罗列的工作事项而非标题')
+        last = text.rstrip()[-1] if text.rstrip() else ''
+        if last in '。；':
+            return ('numbered_body', 'medium',
+                    '以句号/分号结尾，倾向完整叙述句（罗列的工作事项）；'
+                    '但标点只是线索，若实为标题请改判')
+        if last in '？！':
+            # 疑问句标题、号召式小标题同样带问号叹号，无法据此判断
+            return (f'heading{prefix_level}', 'low',
+                    '以问号/叹号结尾——疑问句标题与感叹式事项都可能，'
+                    '标点不足以判定，需结合上下文确认')
         if prefix_level <= 2:
-            # 汉字编号（一、/（一））不会是正文罗列，无句号即标题
-            return (f'heading{prefix_level}', 'high',
-                    '汉字编号且不以句号结尾，是标题')
+            # 汉字编号（一、/（一））通常不会是正文罗列，但仍有例外
+            return (f'heading{prefix_level}', 'medium',
+                    '汉字编号且不以句末标点结尾，通常是标题；'
+                    '未发现 Word 标题样式，属线索判定')
         # 阿拉伯数字编号 + 无句号：可能标题，也可能省略标点的短事项 → 存疑
         return (f'heading{prefix_level}', 'low',
-                '阿拉伯数字编号且不以句号结尾，'
+                '阿拉伯数字编号且不以句末标点结尾，'
                 '可能是标题，也可能是省略标点的短事项')
     return 'body', 'high', '无编号，普通正文'
 
@@ -545,6 +561,61 @@ def _textbox_text(el):
     return ''.join(parts).strip()
 
 
+# 数学公式命名空间（m:），python-docx 的 nsmap 里没有，需手写
+M_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+
+
+def _m(tag):
+    return '{%s}%s' % (M_NS, tag)
+
+
+def _has(el, *tags):
+    return any(True for _ in el.iter(tags[0])) if len(tags) == 1 else \
+        any(any(True for _ in el.iter(t)) for t in tags)
+
+
+# 正文里本技能**没有完整验证过**的内容。检测到必须说出来——
+# 静默漏掉等于交付一份缺内容的文档，使用者还以为排好了。
+UNSUPPORTED = [
+    ('图片', ('w:drawing', 'w:pict'),
+     '正文图片不参与重排，尺寸与位置可能变化，需生成后核对'),
+    ('文本框', ('w:txbxContent',),
+     '文本框内的文字会当普通段落排，框体本身不保留'),
+    ('脚注', ('w:footnoteReference',),
+     '脚注内容不在正文段落里，不会被提取'),
+    ('尾注', ('w:endnoteReference',),
+     '尾注内容不在正文段落里，不会被提取'),
+    ('批注', ('w:commentRangeStart', 'w:commentReference'),
+     '批注不会被提取'),
+    ('修订标记', ('w:ins', 'w:del', 'w:delText'),
+     '按最终显示文本提取；若含未接受的修订，结果可能与预期不符'),
+    ('嵌入对象', ('w:object',),
+     '嵌入对象（图表 / OLE）不会被提取'),
+    ('公式', ('oMath', 'oMathPara'),
+     '公式不会被提取'),
+]
+
+
+def scan_unsupported(elements, skip):
+    """扫描正文里未完整验证的内容，只报告、不擅自处理。
+
+    skip 为版头段落下标——它们已整段原样保留，其中的图片 / 文本框不算问题。
+    """
+    found = {}
+    for i, el in enumerate(elements):
+        if i in skip:
+            continue
+        for name, tags, hint in UNSUPPORTED:
+            probe = [_m(t) if t.startswith('oMath') else qn(t) for t in tags]
+            if _has(el, *probe):
+                rec = found.setdefault(
+                    name, {'count': 0, 'index': [], 'hint': hint})
+                rec['count'] += 1
+                rec['index'].append(i)
+    return [{'kind': k, 'count': v['count'], 'index': v['index'],
+             'hint': v['hint']} for k, v in found.items()]
+
+
 def detect_letterhead(paras, elements):
     """识别红头（发文机关标志）、发文字号、红色分隔线。
 
@@ -600,7 +671,13 @@ def detect_letterhead(paras, elements):
     return picked, detail
 
 
-def build(path):
+def build(path, strip_sign=True):
+    """提取内容与角色建议（不修改原文）。
+
+    strip_sign=False 时不剥离署名 / 成文日期，两段都留在 body。
+    自动剥离靠的是格式特征，在名单式、表格化落款等特殊文档里可能判错，
+    此时应由使用者自己决定怎么处理。
+    """
     doc = Document(path)
 
     # 按文档流顺序遍历，否则表格相对段落的位置会丢失
@@ -666,6 +743,10 @@ def build(path):
     head_idx, head_detail = detect_letterhead(paras, elements)
     head_set = set(head_idx)
 
+    # 正文里未完整验证的内容（图片 / 文本框 / 脚注 / 修订 …）：
+    # 不能静默漏掉，必须列出来让使用者知道哪些东西没被处理
+    unsupported = scan_unsupported(elements, head_set)
+
     # 标题取**首个非空且非版头**的段落：公文标题上方常有空行或文号行，
     # 写死首段会取到空串或红头，还会把真正的标题当正文排一遍。
     title_idx = next((i for i, s in enumerate(paras)
@@ -673,10 +754,11 @@ def build(path):
 
     # 成文日期：整段仅为「2026年3月17日」时几乎必然是落款日期
     date_idx = None
-    for i in range(len(paras) - 1, -1, -1):
-        if i != title_idx and DATE_FULL.match(paras[i]['text'].strip()):
-            date_idx = i
-            break
+    if strip_sign:
+        for i in range(len(paras) - 1, -1, -1):
+            if i != title_idx and DATE_FULL.match(paras[i]['text'].strip()):
+                date_idx = i
+                break
     # 署名：落款日期之上最近的非空短段（机关名一般不以句号结尾）
     sig_idx = None
     if date_idx is not None:
@@ -772,9 +854,26 @@ def build(path):
         result['date'] = paras[date_idx]['text'].strip()
     stripped = []
     for i, field in ((sig_idx, 'signature'), (date_idx, 'date')):
-        if i is not None:
-            stripped.append({'index': i, 'field': field,
-                             'text': paras[i]['text'].strip()})
+        if i is None:
+            continue
+        # 剥离是"猜"出来的，依据必须一并给出，供生成前核对：
+        # 猜错了就是丢一段内容，不能让使用者无从判断
+        rec = {
+            'index': i,
+            'field': field,
+            'text': paras[i]['text'].strip(),
+            'reason': (STRIP_REASON['date'] if field == 'date'
+                       else STRIP_REASON['signature']),
+            'confidence': 'high' if field == 'date' else 'medium',
+            'context': {
+                'prev': paras[i - 1]['text'].strip() if i > 0 else None,
+                'next': (paras[i + 1]['text'].strip()
+                         if i + 1 < len(paras) else None),
+            },
+            'note': '若判断有误，请把该段放回 body 并清空对应字段'
+                    '（或使用 --no-strip 不剥离）',
+        }
+        stripped.append(rec)
     if stripped:
         result['_stripped'] = stripped
     if head_idx:
@@ -792,9 +891,15 @@ def build(path):
         result['_page_number'] = pn['detail']
     if auto_numbered:
         result['_auto_number'] = auto_numbered
+    for u in unsupported:
+        idx = u['index'][:5]
+        more = '…' if u['count'] > 5 else ''
+        warnings.append(f'正文含「{u["kind"]}」（段落 {idx}{more}）：{u["hint"]}')
     conflicts = detect_number_conflicts(paras)
     if conflicts:
         result['_number_conflicts'] = conflicts
+    if unsupported:
+        result['_unsupported'] = unsupported
     if warnings:
         result['_warnings'] = warnings
     if tables:
@@ -809,13 +914,16 @@ def main():
     ap.add_argument('-o', '--output', help='输出 JSON 路径，省略则打印到标准输出')
     ap.add_argument('--no-meta', action='store_true',
                     help='不输出 _src 线索字段，只保留 type/text')
+    ap.add_argument('--no-strip', action='store_true',
+                    help='不剥离署名与成文日期，两段都留在 body'
+                         '（自动剥离在特殊文档中可能判错时使用）')
     args = ap.parse_args()
 
     if not os.path.exists(args.docx):
         print(f'文件不存在: {args.docx}', file=sys.stderr)
         return 1
 
-    result = build(args.docx)
+    result = build(args.docx, strip_sign=not args.no_strip)
     if args.no_meta:
         for item in result['body']:
             item.pop('_src', None)
@@ -842,10 +950,14 @@ def main():
             for a in an:
                 print(f'   第{a["index"]}段 → 「{a["text"]}」'
                       f'（{a["fmt"]}，值={a["value"]}）')
-        if result.get('signature') or result.get('date'):
-            print('落款：已从正文剥离（生成器会重新输出，留在正文里会重复） → '
-                  f"署名「{result.get('signature') or '（无）'}」"
-                  f" 日期「{result.get('date') or '（无）'}」，见 _stripped")
+        st = result.get('_stripped') or []
+        if st:
+            print('落款：已从正文剥离（生成器会重新输出，留在正文里会重复）。'
+                  '这是按格式特征推断的，请核对判断是否属实：')
+            for s in st:
+                print(f"   第{s['index']}段 → {s['field']}「{s['text']}」"
+                      f"（{s['reason']}，置信度 {s['confidence']}）")
+            print('   若判错：把该段放回 body 并清空对应字段，或用 --no-strip 重新提取')
         cand = result.get('_candidates') or []
         if cand:
             print(f'候选要素 {len(cand)} 处（误判代价高，未自动剥离，请确认）：')

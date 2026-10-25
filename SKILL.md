@@ -15,7 +15,7 @@ examples_en:
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
   - "Reformat this request with an attached table, keeping the original page numbering"
-version: 1.11.0
+version: 1.12.0
 author: songdianda
 user-invocable: true
 ---
@@ -47,9 +47,19 @@ user-invocable: true
    - **不覆盖同名文件**：输出路径已存在时，默认自动另存为「原名_2.docx」并打印提示。产出物常被人工二次修改，覆盖不可逆——宁可多出一个 `_2` 文件，也不能让人白改一遍。
    - 用户明确要求覆盖时用 `--on-exist overwrite`；要求"碰到就停下问我"时用 `--on-exist fail`（退出码 2）。
    - 目标文件正被 Word/WPS 打开时会报"无法写入"（退出码 3），提示关闭后重试，不要反复重试。
-6. **交付**：告知输出路径（**若因重名另存，必须告知实际写入的是 `_2` 而非原指定路径**）、实际使用的字体（字体回退情况）、存疑段落的处理结果、
+   - **输入数据会在生成前集中校验**，一次报出所有字段问题（退出码 1）。表格下标越界、单元格写成数字、`page_number` 拼错都会拦下，**不会产出半份文档**。
+   - 多个附件**逐条单独成段**，长名称回行与名称首字对齐（国标 7.3.4），不要拼成一段。
+6. **生成后验收**（不可跳过）：调用 `scripts/verify_output.py` 比对源文件与成品。
+   - 它只比对**内容**——段落文字、表格单元格、图片数量，用来拦住漏字、漏表、漏图。
+   - **它不能证明版式正确**，版式仍需逐页查看。两者是两道检查，不能互相替代。
+   - 报告里会说明有意调整的部分（落款剥离、自动编号补回、版头复制），这些不是缺陷。
+   - 有差异就停下核对，不要带着差异交付。
+7. **交付**：告知输出路径（**若因重名另存，必须告知实际写入的是 `_2` 而非原指定路径**）、实际使用的字体（字体回退情况）、存疑段落的处理结果、
    **版头是否保留**（识别到几段、保留的是什么），
    **`_number_conflicts` 的编号重复与 `_warnings` 的提示**（如"文档以表格开头"），
+   **`_unsupported` 里未完整验证的内容**（正文图片、脚注、修订、公式等，本技能不保留），
+   **`_stripped` 的落款剥离判断**（连判定依据一起转达，请用户确认是否属实），
+   **验收结果**，
    **并主动说明本技能不生成的要素**（版记、印章，以及源文件无版头时不生成红头），
    避免用户误以为拿到的是完整公文。完整说明见 `README.md`。
 
@@ -59,10 +69,14 @@ user-invocable: true
 # 准备依赖（首次）
 pip install python-docx
 
-# 推荐流程：提取 → 定角色 → 渲染
+# 推荐流程：提取 → 定角色 → 渲染 → 验收
 python3 scripts/inspect_docx.py 原文.docx -o content.json   # 提取 + 角色建议 + 存疑清单
 # （审阅 content.json 的 _uncertain，定稿 type）
 python3 scripts/generate_gongwen.py --config content.json --output 公文.docx
+python3 scripts/verify_output.py 原文.docx 公文.docx content.json   # 内容验收
+
+# 不剥离署名与成文日期（自动剥离在特殊文档中可能判错时用）
+python3 scripts/inspect_docx.py 原文.docx -o content.json --no-strip
 
 # 直接给文本（无源文件）
 python3 scripts/generate_gongwen.py --title "关于XXX的请示" --recipient "XX厅" \
@@ -217,6 +231,19 @@ Word 的「一、」「（一）」「1.」有时不是手打的，而是多级�
 | 签发人、份号、密级、紧急程度 | 国标 7.2 版头要素，本技能不处理 |
 | 版记（抄送机关、印发机关和印发日期） | 国标 7.4，需按单位版记格式另行排版 |
 | 印章位置、骑缝章 | 与用印流程绑定，不在排版范围 |
+
+### 正文中不保留的内容（检测到必须提示）
+
+`scripts/inspect_docx.py` 会扫描正文并记录到 `_unsupported`（含处数与段落下标）：
+
+| 内容 | 说明 |
+|------|------|
+| 图片、文本框 | 不参与重排；版头中的图片 / 文本框不在此列，已原样复制 |
+| 脚注、尾注、批注 | 内容不在正文段落里，不会被提取 |
+| 修订标记 | 按最终显示文本提取；含未接受修订时结果可能不符预期 |
+| 嵌入对象（图表 / OLE）、公式 | 不会被提取 |
+
+**不能静默跳过**。交付时必须转达这些条目，让用户知道有什么东西没被带过去。
 
 其他边界：
 

@@ -229,45 +229,87 @@ def _set_doc_grid(section, line_pitch_twips=560):
     docGrid.set(qn('w:linePitch'), str(line_pitch_twips))
 
 
-def set_first_line_indent(paragraph, chars=2):
-    """首行缩进 chars 个字符。
+_IND_ATTRS = ('w:firstLine', 'w:firstLineChars', 'w:left', 'w:leftChars',
+              'w:hanging', 'w:hangingChars', 'w:right', 'w:rightChars')
+
+
+def set_indent_chars(paragraph, left=None, hanging=None,
+                     first_line=None, right=None):
+    """按字符设置缩进，一次写全。
 
     python-docx 的 Normal 样式自带 firstLineChars=200，直接追加会叠加导致缩进翻倍，
     必须先清除已有缩进属性，再同时写入字符值与绝对值（Word 以字符值优先）。
+
+    四个方向都可指定；未指定的方向会被清除，避免旧值与新值叠加。
+      left       整段左缩进
+      hanging    悬挂缩进：首行不动，后续行相对首行右移（用于回行对齐）
+      first_line 首行缩进
+      right      整段右缩进
+
+    **注意：字符值的实际宽度由文档默认字号决定，不是当前段落字号。**
+    用它排三号字公文时「2 字符」只有 7.8mm（按默认 11pt 折算），而国标要的是
+    11.3mm。公文正文排版请用 `set_indent_pt`。本函数仅在确实需要按字符单位
+    表达时保留。
     """
     pPr = paragraph._element.get_or_add_pPr()
     ind = pPr.find(qn('w:ind'))
     if ind is None:
         ind = OxmlElement('w:ind')
         pPr.append(ind)
-    for attr in ('w:firstLine', 'w:firstLineChars', 'w:left', 'w:leftChars',
-                 'w:hanging', 'w:hangingChars', 'w:right', 'w:rightChars'):
+    for attr in _IND_ATTRS:
         if ind.get(qn(attr)) is not None:
             del ind.attrib[qn(attr)]
-    ind.set(qn('w:firstLineChars'), str(chars * 100))
-    ind.set(qn('w:firstLine'), str(chars * 320))
+    for chars, char_attr, abs_attr in (
+            (left, 'w:leftChars', 'w:left'),
+            (hanging, 'w:hangingChars', 'w:hanging'),
+            (first_line, 'w:firstLineChars', 'w:firstLine'),
+            (right, 'w:rightChars', 'w:right'),
+    ):
+        if chars:
+            ind.set(qn(char_attr), str(int(chars * 100)))
+            ind.set(qn(abs_attr), str(int(chars * 320)))
+
+
+def set_indent_pt(paragraph, left=None, right=None,
+                  first_line=None, hanging=None):
+    """按磅设置缩进，只写绝对值、不写字符值。
+
+    用于页码「居右空一字」「居左空一字」：此处的「一字」按正文三号字（16 磅 =
+    5.64mm）计。若同时写 rightChars，Word 会优先按字符值解释，而字符值按文档
+    默认字号（多数模板是五号）折算，实测只有 3.8mm，达不到一字的 5.64mm。
+    """
+    pPr = paragraph._element.get_or_add_pPr()
+    ind = pPr.find(qn('w:ind'))
+    if ind is None:
+        ind = OxmlElement('w:ind')
+        pPr.append(ind)
+    for attr in _IND_ATTRS:
+        if ind.get(qn(attr)) is not None:
+            del ind.attrib[qn(attr)]
+    for pt, attr in ((left, 'w:left'), (right, 'w:right'),
+                     (first_line, 'w:firstLine'), (hanging, 'w:hanging')):
+        if pt:
+            ind.set(qn(attr), str(int(round(pt * 20))))    # 磅 → twips
+
+
+def set_first_line_indent(paragraph, chars=2):
+    """首行缩进 chars 个字符（按正文三号字折算成磅值写入）。
+
+    只写绝对值、不写 firstLineChars：字符值的实际宽度由文档默认字号决定
+    （python-docx 模板默认 11pt），用它排三号字的公文会得到 7.8mm 而不是
+    11.3mm——实测渲染确认。写死磅值，「2 字符」在任何渲染器下都是 11.3mm。
+    """
+    set_indent_pt(paragraph, first_line=chars * SIZE_BODY)
 
 
 def set_right_indent_chars(paragraph, chars=1):
-    """右缩进 chars 个字符（用于单页码居右空一字）。"""
-    pPr = paragraph._element.get_or_add_pPr()
-    ind = pPr.find(qn('w:ind'))
-    if ind is None:
-        ind = OxmlElement('w:ind')
-        pPr.append(ind)
-    ind.set(qn('w:rightChars'), str(chars * 100))
-    ind.set(qn('w:right'), str(chars * 320))
+    """右缩进 chars 个字符（按正文字号折算，用于署名右空二字等）。"""
+    set_indent_pt(paragraph, right=chars * SIZE_BODY)
 
 
 def set_left_indent_chars(paragraph, chars=1):
-    """左缩进 chars 个字符（用于双页码居左空一字）。"""
-    pPr = paragraph._element.get_or_add_pPr()
-    ind = pPr.find(qn('w:ind'))
-    if ind is None:
-        ind = OxmlElement('w:ind')
-        pPr.append(ind)
-    ind.set(qn('w:leftChars'), str(chars * 100))
-    ind.set(qn('w:left'), str(chars * 320))
+    """左缩进 chars 个字符（按正文字号折算）。"""
+    set_indent_pt(paragraph, left=chars * SIZE_BODY)
 
 
 def add_paragraph(doc, text, font_name=None, font_size=SIZE_BODY,
@@ -288,6 +330,28 @@ def add_paragraph(doc, text, font_name=None, font_size=SIZE_BODY,
 def add_blank(doc, line_spacing=LINE_BODY):
     para = doc.add_paragraph()
     set_line_spacing(para, line_spacing)
+    return para
+
+
+# 附件说明用的序号前缀「1. 」= 半角数字 + 半角点 + 半角空格，约占 1.5 个汉字宽。
+# 悬挂缩进要按这个宽度算，否则续行无法与附件名称首字对齐。
+_NUM_PREFIX_CHARS = 1.5
+
+
+def _add_attachment_para(doc, prefix, name, left, hanging):
+    """附件说明一行。
+
+    参数按 OOXML 语义：left 是**续行**的左边界，hanging 是首行相对续行
+    **向左突出**的量（w:hanging 让首行左移）。因此首行起始 = left - hanging。
+    想让首行在 S 字处、回行在 C 字处，应取 left=C、hanging=C-S。
+    字数按正文三号字折算成磅值写入，避免被文档默认字号带偏。
+    """
+    para = doc.add_paragraph()
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    set_line_spacing(para, LINE_BODY)
+    set_indent_pt(para, left=left * SIZE_BODY, hanging=hanging * SIZE_BODY)
+    run = para.add_run(prefix + name)
+    set_font(run, FONT_BODY, SIZE_BODY)
     return para
 
 
@@ -784,6 +848,15 @@ def _make_footer_paragraph(footer, align, indent_fn):
     return para
 
 
+# 页脚距页底的距离（mm）。
+# 国标 7.5：页码一字线的上沿距版心下边缘 7mm。版心下边缘距页底 35mm，
+# 故页码应在距页底 28mm 附近；又因页脚内容自页脚顶边向下排、且字形上沿
+# 距行顶尚有一段空隙，实测校准后取 23.58mm。
+# 校准方法：生成多页样本 → LibreOffice 转 PDF → 按 300dpi 渲染扫描墨迹，
+# 量出一字线上沿相对版心下边缘的距离（原取 4.58mm 时实测 26.00mm，偏差 +19.00mm）。
+FOOTER_DISTANCE_MM = 23.58
+
+
 def add_page_number(section, mode=PAGE_NUMBER_DEFAULT):
     """添加页码。
 
@@ -799,7 +872,7 @@ def add_page_number(section, mode=PAGE_NUMBER_DEFAULT):
         footer = section.footer
         footer.is_linked_to_previous = False
         _make_footer_paragraph(footer, WD_ALIGN_PARAGRAPH.CENTER, None)
-        section.footer_distance = Mm(4.58)
+        section.footer_distance = Mm(FOOTER_DISTANCE_MM)
         return
 
     # odd_even
@@ -815,19 +888,24 @@ def add_page_number(section, mode=PAGE_NUMBER_DEFAULT):
         else:
             settings.append(flag)
 
-    # 2) 奇数页页脚（default）：居右空一字
+    # 2) 奇数页页脚（default）：居右空一字。
+    #    「一字」按正文三号字（16 磅）算，故用磅值而非字符值
     footer_odd = section.footer
     footer_odd.is_linked_to_previous = False
-    _make_footer_paragraph(footer_odd, WD_ALIGN_PARAGRAPH.RIGHT, set_right_indent_chars)
+    _make_footer_paragraph(
+        footer_odd, WD_ALIGN_PARAGRAPH.RIGHT,
+        lambda p: set_indent_pt(p, right=SIZE_BODY))
 
     # 3) 偶数页页脚（even）：居左空一字。取不到时降级，仅保留奇数页页码
     footer_even = _get_even_footer(section)
     if footer_even is not None:
         footer_even.is_linked_to_previous = False
-        _make_footer_paragraph(footer_even, WD_ALIGN_PARAGRAPH.LEFT, set_left_indent_chars)
+        _make_footer_paragraph(
+            footer_even, WD_ALIGN_PARAGRAPH.LEFT,
+            lambda p: set_indent_pt(p, left=SIZE_BODY))
 
-    # 4) 页脚位置：4.58mm（叠加 4 号字半高后，一字线距版心下边缘约 7mm）
-    section.footer_distance = Mm(4.58)
+    # 4) 页脚位置：见 FOOTER_DISTANCE_MM（实测校准，非估算）
+    section.footer_distance = Mm(FOOTER_DISTANCE_MM)
 
 
 def _get_even_footer(section):
@@ -841,6 +919,166 @@ def _get_even_footer(section):
 
 
 # ── 主体构建 ─────────────────────────────────────────────
+
+
+def validate_content(content):
+    """生成前集中校验输入数据，一次性报出全部问题。
+
+    只做标题检查远远不够：body 引用了不存在的表格、tables 里混进数字单元格、
+    page_number 拼错，都会产出一份内容缺失或格式不对的文档。
+    这里把类型与取值一次查完，报出具体字段和原因，而不是生成到一半才失败。
+
+    返回警告列表（不阻断的问题，如未知 type 降级为正文）。
+    发现阻断性问题时抛 ValueError，错误信息含全部问题。
+    """
+    errors = []
+    warns = []
+    if not isinstance(content, dict):
+        raise TypeError(f'content 必须是 dict，实际是 {type(content).__name__}')
+
+    def _str_field(name, maxlen):
+        v = content.get(name)
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            errors.append(f'{name}：应为字符串，实际是 {type(v).__name__}'
+                          f'（值 {v!r}）')
+            return None
+        if maxlen and len(v) > maxlen:
+            warns.append(f'{name}：长度 {len(v)} 超过 {maxlen}，'
+                         f'可能是误把大段文本填进了该字段')
+        return v
+
+    _str_field('title', 200)
+    _str_field('recipient', 200)
+    _str_field('signature', 100)
+    _str_field('date', 50)
+    _str_field('output', 500)
+
+    tables = content.get('tables')
+    if tables is None:
+        tables = []
+    elif not isinstance(tables, list):
+        errors.append(f'tables：应为列表，实际是 {type(tables).__name__}')
+        tables = []
+    else:
+        for ti, t in enumerate(tables):
+            if not isinstance(t, dict):
+                errors.append(f'tables[{ti}]：应为 dict，实际是 {type(t).__name__}')
+                continue
+            rows = t.get('rows')
+            if rows is None:
+                errors.append(f'tables[{ti}]：缺少 rows')
+                continue
+            if not isinstance(rows, list) or not rows:
+                errors.append(f'tables[{ti}].rows：应为非空列表')
+                continue
+            widths = set()
+            for ri, row in enumerate(rows):
+                if not isinstance(row, list):
+                    errors.append(f'tables[{ti}].rows[{ri}]：应为列表，'
+                                  f'实际是 {type(row).__name__}')
+                    continue
+                widths.add(len(row))
+                for ci, cell in enumerate(row):
+                    if not isinstance(cell, str):
+                        errors.append(
+                            f'tables[{ti}].rows[{ri}][{ci}]：应为字符串，'
+                            f'实际是 {type(cell).__name__}（值 {cell!r}）；'
+                            f'数字请写成 "300" 而不是 300')
+            if len(widths) > 1:
+                warns.append(f'tables[{ti}]：各行列数不一致 {sorted(widths)}，'
+                             f'缺的格子会留空')
+            spans = t.get('spans')
+            if spans is not None:
+                if not isinstance(spans, list) or len(spans) != len(rows):
+                    errors.append(
+                        f'tables[{ti}].spans：应为与 rows 等长的列表，'
+                        f'实际 rows {len(rows)} 行、spans '
+                        f'{len(spans) if isinstance(spans, list) else "非列表"}')
+
+    body = content.get('body')
+    if body is None:
+        body = []
+    elif not isinstance(body, list):
+        errors.append(f'body：应为列表，实际是 {type(body).__name__}')
+        body = []
+    else:
+        for bi, item in enumerate(body):
+            if isinstance(item, str):
+                continue
+            if not isinstance(item, dict):
+                errors.append(f'body[{bi}]：应为字符串或 dict，'
+                              f'实际是 {type(item).__name__}')
+                continue
+            typ = item.get('type')
+            if typ == 'table':
+                idx = item.get('index', 0)
+                if not isinstance(idx, int) or isinstance(idx, bool):
+                    errors.append(f'body[{bi}].index：应为整数，实际是 {idx!r}')
+                elif not (0 <= idx < len(tables)):
+                    errors.append(
+                        f'body[{bi}].index={idx}：超出 tables 范围'
+                        f'（tables 共 {len(tables)} 个，合法下标 '
+                        f'0..{max(len(tables) - 1, 0)}）')
+                continue
+            if typ is None:
+                errors.append(f'body[{bi}]：dict 形式必须带 type 字段')
+                continue
+            if typ not in ROLE_ALIASES and typ not in ROLE_STYLES:
+                warns.append(f'body[{bi}].type={typ!r}：不是已知角色，'
+                             f'已按正文处理（可用 '
+                             f'{", ".join(sorted(ROLE_STYLES))}）')
+            if 'text' not in item:
+                errors.append(f'body[{bi}]：缺少 text 字段')
+            elif not isinstance(item['text'], str):
+                errors.append(f'body[{bi}].text：应为字符串，'
+                              f'实际是 {type(item["text"]).__name__}')
+
+    attachments = content.get('attachments')
+    if attachments is not None:
+        if not isinstance(attachments, list):
+            errors.append(f'attachments：应为列表，'
+                          f'实际是 {type(attachments).__name__}')
+        else:
+            for ai, a in enumerate(attachments):
+                if not isinstance(a, str):
+                    errors.append(f'attachments[{ai}]：应为字符串，'
+                                  f'实际是 {type(a).__name__}（值 {a!r}）')
+
+    pn = content.get('page_number')
+    if pn is not None and resolve_page_number_mode(pn) is None:
+        errors.append(f'page_number：取值 {pn!r} 无法识别，可选 {PAGE_NUMBER_MODES}')
+
+    oe = content.get('on_exist')
+    if oe is not None and resolve_on_exist(oe) is None:
+        errors.append(f'on_exist：取值 {oe!r} 无法识别，可选 {ON_EXIST_MODES}')
+
+    header = content.get('header')
+    if header is not None:
+        if not isinstance(header, dict):
+            errors.append(f'header：应为 dict，实际是 {type(header).__name__}')
+        else:
+            src = header.get('source')
+            if not src:
+                errors.append('header：缺少 source（源文件路径）')
+            elif not os.path.exists(src):
+                errors.append(f'header.source：源文件不存在 —— {src}；'
+                              f'版头将无法保留')
+            idxs = header.get('indices')
+            if not idxs:
+                errors.append('header：缺少 indices（版头段落下标）')
+            elif (not isinstance(idxs, list)
+                  or not all(isinstance(i, int) and not isinstance(i, bool)
+                             for i in idxs)):
+                errors.append(f'header.indices：应为整数列表，实际是 {idxs!r}')
+
+    if errors:
+        raise ValueError(
+            f'输入数据校验未通过，共 {len(errors)} 处：\n  - '
+            + '\n  - '.join(errors))
+    return warns
+
 
 def build_document(content, output_path, on_exist=None):
     """根据 content 字典生成公文 DOCX。
@@ -872,6 +1110,10 @@ def build_document(content, output_path, on_exist=None):
     if not title:
         raise ValueError('缺少 title：公文标题为必填项，'
                          '请传 --title 或在 content 中设置 title')
+    # 其余字段一次查完：类型错、取值越界都会产出内容缺失的文档，
+    # 与其生成后才发现，不如生成前集中报出
+    for w in validate_content(content):
+        print(f'警告：{w}')
     doc = Document()
 
     # 字体回退：把国标字体名换成本机实际可用的等效字体
@@ -931,9 +1173,13 @@ def build_document(content, output_path, on_exist=None):
                           spans=t.get('spans'), ncol=t.get('ncol'))
                 used_tables.add(idx)
             else:
-                # 静默跳过等于丢内容，必须出声
-                print(f'警告：body 引用了表格 index={idx}，'
-                      f'但 tables 只有 {len(tables)} 个，该表格未输出')
+                # 引用了不存在的表格 = 会交付一份缺表的公文，属内容丢失。
+                # 不能只警告后继续，必须停下来让使用者补齐。
+                raise ValueError(
+                    f'body 引用了表格 index={idx}，但 tables 只有 {len(tables)} 个'
+                    f'（合法下标 0..{len(tables) - 1}）。'
+                    f'请补全 tables 或删除该引用后再生成——'
+                    f'继续生成会产出缺表的文档。')
             continue
 
         text, role = resolve_role(item)
@@ -943,18 +1189,25 @@ def build_document(content, output_path, on_exist=None):
         font_role, bold = ROLE_STYLES[role]
         add_paragraph(doc, text, font_name=font_by_role[font_role], bold=bold)
 
-    # 附件说明（7.3.4）
-    attachments = content.get('attachments') or []
+    # 附件说明（7.3.4）：每个附件单独一段，回行与名称首字对齐
+    attachments = [str(a).strip() for a in (content.get('attachments') or [])
+                   if str(a).strip()]
     if attachments:
         add_blank(doc)
         if len(attachments) == 1:
-            text = '附件：' + attachments[0]
+            # 首行「附件：」左空二字起排，回行落到名称首字（再右移 3 字）
+            _add_attachment_para(doc, '附件：', attachments[0],
+                                 left=2 + 3, hanging=3)
         else:
-            text = '附件：' + '　'.join(f'{i}. {a}'
-                                    for i, a in enumerate(attachments, 1))
-        attach_para = add_paragraph(doc, text)
-        # 回行与首字对齐：此处用悬挂缩进近似
-        set_first_line_indent(attach_para, 2)
+            # 续行统一落在 6.5 字处（名称首字）；序号对齐在 5 字处
+            cont = 2 + 3 + _NUM_PREFIX_CHARS
+            for i, name in enumerate(attachments, 1):
+                if i == 1:
+                    _add_attachment_para(doc, f'附件：{i}. ', name,
+                                         left=cont, hanging=3 + _NUM_PREFIX_CHARS)
+                else:
+                    _add_attachment_para(doc, f'{i}. ', name,
+                                         left=cont, hanging=_NUM_PREFIX_CHARS)
 
     # 发文机关署名与成文日期（7.3.5）
     signature = content.get('signature')
