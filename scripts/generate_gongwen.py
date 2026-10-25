@@ -352,7 +352,33 @@ def detect_level(text):
     return None
 
 
-# ── 页码（奇偶页不同） ────────────────────────────────────
+# ── 页码 ─────────────────────────────────────────────────
+
+# 页码样式。默认 center：多数单位内行文、呈报稿按居中排，也便于双面打印装订。
+#   center    居中（默认）——所有页页码居中，不区分奇偶页
+#   odd_even  奇偶页不同——单页居右空一字、双页居左空一字（GB/T 9704-2012 7.5）
+#   none      不显示页码
+PAGE_NUMBER_MODES = ('center', 'odd_even', 'none')
+PAGE_NUMBER_DEFAULT = 'center'
+
+# 页码别名，容错常见写法
+PAGE_NUMBER_ALIASES = {
+    'center': 'center', 'centre': 'center', 'middle': 'center', '居中': 'center',
+    'odd_even': 'odd_even', 'odd-even': 'odd_even', 'oddeven': 'odd_even',
+    'parity': 'odd_even', '奇偶': 'odd_even', '奇偶页': 'odd_even',
+    'none': 'none', 'off': 'none', 'no': 'none', 'hide': 'none',
+    '不显示': 'none', '无': 'none',
+}
+
+
+def resolve_page_number_mode(value):
+    """把配置值归一到 PAGE_NUMBER_MODES 之一；无法识别时返回 None。"""
+    if value is None:
+        return PAGE_NUMBER_DEFAULT
+    key = str(value).strip().lower()
+    key = PAGE_NUMBER_ALIASES.get(key, key)
+    return key if key in PAGE_NUMBER_MODES else None
+
 
 def _page_field_runs(paragraph):
     """在段落中追加 '— PAGE —' 域代码。"""
@@ -390,8 +416,25 @@ def _make_footer_paragraph(footer, align, indent_fn):
     return para
 
 
-def add_page_number(section):
-    """添加奇偶页不同的页码：单页码居右空一字，双页码居左空一字（7.5）。"""
+def add_page_number(section, mode=PAGE_NUMBER_DEFAULT):
+    """添加页码。
+
+    mode='center'   所有页页码居中（默认）
+    mode='odd_even' 单页码居右空一字、双页码居左空一字（GB/T 9704-2012 7.5）
+    mode='none'     不添加页码
+    """
+    if mode == 'none':
+        return
+
+    if mode == 'center':
+        # 只挂 default 页脚并居中；不开启奇偶页不同，避免 Word 去找空的 even 页脚
+        footer = section.footer
+        footer.is_linked_to_previous = False
+        _make_footer_paragraph(footer, WD_ALIGN_PARAGRAPH.CENTER, None)
+        section.footer_distance = Mm(4.58)
+        return
+
+    # odd_even
     # 1) 开启奇偶页不同
     settings = section.part.document.settings.element
     if settings.find(qn('w:evenAndOddHeaders')) is None:
@@ -436,6 +479,7 @@ def build_document(content, output_path):
       attachments 附件名称列表（可选）
       signature   发文机关署名（可选）
       date        成文日期（可选）
+      page_number 页码样式：center（默认，居中）/ odd_even（奇偶页不同）/ none（不显示）
       output      输出路径（可选，优先级低于 output_path 参数）
     """
     doc = Document()
@@ -542,7 +586,12 @@ def build_document(content, output_path):
                       align=t.get('align', 'center'))
 
     # 页码
-    add_page_number(section)
+    mode = resolve_page_number_mode(content.get('page_number'))
+    if mode is None:
+        raise ValueError(
+            f"page_number 取值无法识别：{content.get('page_number')!r}，"
+            f"可选 {PAGE_NUMBER_MODES}")
+    add_page_number(section, mode)
 
     out = output_path or content.get('output')
     if not out:
@@ -596,6 +645,9 @@ def main():
     parser.add_argument('--signature', help='发文机关署名')
     parser.add_argument('--date', help='成文日期')
     parser.add_argument('--output', '-o', help='输出 .docx 路径')
+    parser.add_argument('--page-number', dest='page_number',
+                        choices=PAGE_NUMBER_MODES, default=None,
+                        help='页码样式：center 居中（默认）/ odd_even 奇偶页不同 / none 不显示')
     parser.add_argument('--check-fonts', action='store_true', help='检查字体并退出')
     args = parser.parse_args()
 
@@ -618,6 +670,9 @@ def main():
     if args.config:
         with open(args.config, encoding='utf-8') as f:
             content = json.load(f)
+        # 命令行显式指定时覆盖配置文件
+        if args.page_number:
+            content['page_number'] = args.page_number
     else:
         if not args.title:
             parser.error('需要 --config，或至少提供 --title')
@@ -632,6 +687,7 @@ def main():
             'attachments': args.attachments or [],
             'signature': args.signature,
             'date': args.date,
+            'page_number': args.page_number or PAGE_NUMBER_DEFAULT,
         }
 
     out = args.output or content.get('output')

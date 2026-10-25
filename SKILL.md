@@ -13,7 +13,7 @@ examples_en:
   - "Format this meeting minutes into a standard official Word document"
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
-version: 1.3.0
+version: 1.4.0
 author: songdianda
 ---
 
@@ -35,7 +35,8 @@ author: songdianda
    - 拿不准时默认按 `numbered_body`（保留编号、不加粗），并把疑问集中列表请用户确认。
    - **不自动改动编号**；编号错误只在用户要求时按 `numbering-rules.md` 修正并单独报告。
 3. **编号检查**：对照 `references/numbering-rules.md` 检查跳层、跳号、半角括号等。有问题用表格列出「段落位置 / 原文编号 / 问题 / 修正为」，征询后再改。**不擅自改动用户原意。**
-4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、输出路径。用户未提供的项目逐项询问，**不编造**。
+4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、**页码样式**、输出路径。用户未提供的项目逐项询问，**不编造**。
+   - 页码样式需主动询问：`center` 居中 / `odd_even` 奇偶页不同 / `none` 不显示。用户未指定时**默认 `center` 居中**，并在交付时说明。
 5. **生成文件**：调用 `scripts/generate_gongwen.py`，格式参数见 `references/format-spec.md`。
 6. **交付**：告知输出路径、实际使用的字体（字体回退情况），以及存疑段落的处理结果。
 
@@ -76,9 +77,21 @@ python3 scripts/generate_gongwen.py --check-fonts
   "attachments": ["附件名称"],
   "signature": "发文机关署名",
   "date": "2026年3月17日",
+  "page_number": "center",
   "output": "公文.docx"
 }
 ```
+
+`page_number` 控制页码样式，**由使用者选择**：
+
+| 取值 | 效果 |
+|------|------|
+| `center`（默认） | 页码**居中** |
+| `odd_even` | 单页居右空一字、双页居左空一字（GB/T 9704-2012 7.5） |
+| `none` | 不显示页码 |
+
+默认居中：7.5 的左右错位是为**双面装订**设计的，单面打印或电子传阅时页码忽左忽右反而凌乱。
+**确认要素阶段应主动问一句页码样式**，用户未指定则按居中生成。命令行可用 `--page-number center|odd_even|none` 覆盖。
 
 `type` 取值：`heading1`~`heading5`、`body`、`numbered_body`、`blank`、`table`。
 
@@ -101,7 +114,7 @@ python3 scripts/generate_gongwen.py --check-fonts
 | 第一层 `一、` | 黑体 | 三号 | 28磅 |
 | 第二层 `（一）` | 楷体_GB2312 | 三号 | 28磅 |
 | 三/四/五层 | 仿宋_GB2312 加粗 | 三号 | 28磅 |
-| 页码 | 宋体 | 四号 14磅 | 单页右空一字 / 双页左空一字 |
+| 页码 | 宋体 | 四号 14磅 | 默认居中；可选 `odd_even` / `none` |
 
 页面：A4，上 37mm、下 35mm、左 28mm、右 26mm。正文每自然段首行缩进 2 字符。
 
