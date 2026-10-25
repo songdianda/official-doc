@@ -786,7 +786,12 @@ def main():
     if not out:
         parser.error('未指定输出路径，请用 --output 指定')
 
-    path = build_document(content, out)
+    try:
+        path = build_document(content, out)
+    except ValueError as e:
+        # 直接抛 traceback 对用户没有意义，给出一句能照着改的提示
+        print(f'错误：{e}', file=sys.stderr)
+        return 1
     print(f'公文已生成: {os.path.abspath(path)}')
     return 0
 
