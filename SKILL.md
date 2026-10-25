@@ -15,7 +15,7 @@ examples_en:
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
   - "Reformat this request with an attached table, keeping the original page numbering"
-version: 1.9.1
+version: 1.10.0
 author: songdianda
 user-invocable: true
 ---
@@ -44,7 +44,10 @@ user-invocable: true
 4. **确认要素**：标题、主送机关、正文、附件、发文机关署名、成文日期、输出路径。用户未提供的项目逐项询问，**不编造**。
    - **页码不在此列**：有源文件时以源文件为准（无页码就不加），无源文件时默认居中，交付时说明采用的值。
 5. **生成文件**：调用 `scripts/generate_gongwen.py`，格式参数见 `references/format-spec.md`。
-6. **交付**：告知输出路径、实际使用的字体（字体回退情况）、存疑段落的处理结果、
+   - **不覆盖同名文件**：输出路径已存在时，默认自动另存为「原名_2.docx」并打印提示。产出物常被人工二次修改，覆盖不可逆——宁可多出一个 `_2` 文件，也不能让人白改一遍。
+   - 用户明确要求覆盖时用 `--on-exist overwrite`；要求"碰到就停下问我"时用 `--on-exist fail`（退出码 2）。
+   - 目标文件正被 Word/WPS 打开时会报"无法写入"（退出码 3），提示关闭后重试，不要反复重试。
+6. **交付**：告知输出路径（**若因重名另存，必须告知实际写入的是 `_2` 而非原指定路径**）、实际使用的字体（字体回退情况）、存疑段落的处理结果、
    **版头是否保留**（识别到几段、保留的是什么），
    **并主动说明本技能不生成的要素**（版记、印章，以及源文件无版头时不生成红头），
    避免用户误以为拿到的是完整公文。完整说明见 `README.md`。
@@ -87,9 +90,13 @@ python3 scripts/generate_gongwen.py --check-fonts
   "signature": "发文机关署名",
   "date": "2026年3月17日",
   "page_number": "center",
+  "on_exist": "rename",
   "output": "公文.docx"
 }
 ```
+
+`on_exist` 控制输出文件已存在时的行为，**默认 `rename`（自动另存为「原名_2.docx」）**，
+返回值为实际写入路径。切勿在用户未明确要求时使用 `overwrite`。
 
 `page_number` 控制页码样式，**由使用者选择**：
 

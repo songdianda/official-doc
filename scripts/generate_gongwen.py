@@ -698,6 +698,56 @@ def resolve_page_number_mode(value):
     return key if key in PAGE_NUMBER_MODES else None
 
 
+# 输出文件已存在时的处理方式。默认 rename：
+# 产出物常被人工二次修改（补内容、调措辞），直接覆盖会让这些修改无声消失，
+# 而"文件被覆盖"是不可撤销的。宁可多出一个 _2 文件，也不能让人白改一遍。
+#   rename     自动另存为「原名_2.docx」「_3.docx」…（默认）
+#   fail       停止生成并提示，交给使用者决定
+#   overwrite  覆盖同名文件（仅在明确要求时使用）
+ON_EXIST_MODES = ('rename', 'fail', 'overwrite')
+ON_EXIST_DEFAULT = 'rename'
+ON_EXIST_ALIASES = {
+    'rename': 'rename', 'new': 'rename', 'auto': 'rename', '另存': 'rename',
+    '另存为': 'rename', '新建': 'rename',
+    'fail': 'fail', 'stop': 'fail', 'abort': 'fail', 'error': 'fail',
+    '停止': 'fail', '中止': 'fail', '提示': 'fail',
+    'overwrite': 'overwrite', 'replace': 'overwrite', 'force': 'overwrite',
+    '覆盖': 'overwrite', '替换': 'overwrite',
+}
+
+
+def resolve_on_exist(value):
+    """把配置值归一到 ON_EXIST_MODES 之一；无法识别时返回 None。"""
+    if value is None:
+        return ON_EXIST_DEFAULT
+    key = str(value).strip().lower()
+    key = ON_EXIST_ALIASES.get(key, key)
+    return key if key in ON_EXIST_MODES else None
+
+
+def resolve_output_path(path, on_exist):
+    """按 on_exist 策略确定最终写入路径。
+
+    rename：找第一个不存在的「原名_N」；fail：抛 FileExistsError；
+    overwrite 或文件本不存在：原样返回。
+    """
+    if on_exist not in ON_EXIST_MODES:
+        raise ValueError(f'on_exist 取值无法识别：{on_exist!r}，可选 {ON_EXIST_MODES}')
+    if not os.path.exists(path):
+        return path, None
+    if on_exist == 'overwrite':
+        return path, None
+    if on_exist == 'fail':
+        raise FileExistsError(path)
+    stem, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f'{stem}_{n}{ext}'):
+        n += 1
+        if n > 999:                      # 兜底，避免异常情况下死循环
+            raise RuntimeError(f'同名文件过多，无法确定新文件名：{path}')
+    return f'{stem}_{n}{ext}', path
+
+
 def _page_field_runs(paragraph):
     """在段落中追加 '— PAGE —' 域代码。"""
     run1 = paragraph.add_run('— ')
@@ -792,8 +842,12 @@ def _get_even_footer(section):
 
 # ── 主体构建 ─────────────────────────────────────────────
 
-def build_document(content, output_path):
+def build_document(content, output_path, on_exist=None):
     """根据 content 字典生成公文 DOCX。
+
+    输出文件已存在时默认**不覆盖**，自动另存为「原名_2.docx」并返回新路径，
+    以免覆盖掉人工二次修改的内容。可用 on_exist 改变该行为：
+    rename（默认）/ fail（报错停止）/ overwrite（覆盖）。
 
     content 支持字段：
       title       标题（必填）
@@ -811,6 +865,8 @@ def build_document(content, output_path):
                   odd_even（奇偶页不同）/ none（不显示）
                   有源文件时由 inspect_docx.py 按源文档推断
       output      输出路径（可选，优先级低于 output_path 参数）
+      on_exist    输出文件已存在时的处理：rename（默认，自动另存）/ fail / overwrite
+                  （同名字段优先级低于 on_exist 参数）
     """
     title = (content.get('title') or '').strip()
     if not title:
@@ -940,10 +996,28 @@ def build_document(content, output_path):
     out = output_path or content.get('output')
     if not out:
         raise ValueError('未指定输出路径：请传 output_path 或在 content 中设置 output')
+
+    mode = resolve_on_exist(on_exist if on_exist is not None
+                            else content.get('on_exist'))
+    if mode is None:
+        raise ValueError(f"on_exist 取值无法识别：{content.get('on_exist')!r}，"
+                         f"可选 {ON_EXIST_MODES}")
+    out, original = resolve_output_path(out, mode)
+    if original:
+        print(f'注意：{os.path.basename(original)} 已存在，未覆盖该文件；'
+              f'本次另存为 {os.path.basename(out)}')
+
     out_dir = os.path.dirname(os.path.abspath(out))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    doc.save(out)
+    try:
+        doc.save(out)
+    except PermissionError:
+        # 常见于产出物正被 Word/WPS 打开着，此时覆盖会失败且原因不直观
+        raise PermissionError(
+            f'无法写入 {os.path.abspath(out)}：'
+            '文件可能正被 Word/WPS 打开，或没有写入权限。'
+            '请关闭该文件或换一个输出路径后重试。')
 
     changed = {k: v for k, v in font_report.items() if v[0] != v[1]}
     if changed:
@@ -989,6 +1063,10 @@ def main():
     parser.add_argument('--signature', help='发文机关署名')
     parser.add_argument('--date', help='成文日期')
     parser.add_argument('--output', '-o', help='输出 .docx 路径')
+    parser.add_argument('--on-exist', dest='on_exist', choices=ON_EXIST_MODES,
+                        default=None,
+                        help='输出文件已存在时的处理：rename 自动另存为「原名_2」'
+                             '（默认）/ fail 停止并提示 / overwrite 覆盖')
     parser.add_argument('--page-number', dest='page_number',
                         choices=PAGE_NUMBER_MODES, default=None,
                         help='页码样式：center 居中（默认）/ odd_even 奇偶页不同 / none 不显示')
@@ -1039,11 +1117,21 @@ def main():
         parser.error('未指定输出路径，请用 --output 指定')
 
     try:
-        path = build_document(content, out)
+        path = build_document(content, out, on_exist=args.on_exist)
     except ValueError as e:
         # 直接抛 traceback 对用户没有意义，给出一句能照着改的提示
         print(f'错误：{e}', file=sys.stderr)
         return 1
+    except FileExistsError as e:
+        target = getattr(e, 'filename', None) or out
+        print(f'已停止：输出文件已存在，为避免覆盖未生成新文件。', file=sys.stderr)
+        print(f'  {os.path.abspath(target)}', file=sys.stderr)
+        print('  处理方式：另指定 --output；或加 --on-exist rename 自动另存为'
+              '「原名_2」；或加 --on-exist overwrite 明确覆盖。', file=sys.stderr)
+        return 2
+    except PermissionError as e:
+        print(f'错误：{e}', file=sys.stderr)
+        return 3
     print(f'公文已生成: {os.path.abspath(path)}')
     return 0
 

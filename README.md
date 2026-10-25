@@ -123,6 +123,11 @@
 
 **由你指定**。不指定就落在当前工作目录，不会自作主张存到桌面或某个固定文件夹。文件名也由你定。
 
+**不会覆盖已存在的文件。** 指定的输出名如果已经存在，会自动另存为「原名_2.docx」并告诉你存到了哪，你手工改过的内容不会丢。想要别的行为可以直说：
+
+> 覆盖原来那份，不用另存
+> 碰到同名文件就停下问我
+
 ---
 
 ## 四、过程中会被问到什么
@@ -182,6 +187,10 @@ Word 自动编号不是段落文字，挂在 `w:numPr` 上，普通读取会整�
 **Q：原文件会被改吗？**
 不会。始终生成新文件，原文件原样保留。
 
+**Q：我手工改过的产出物，再排一次会不会被覆盖？**
+不会。输出名已存在时默认自动另存为「原名_2.docx」并提示存到了哪，原文件一字不动；只有你明确说"覆盖原来那份"时才会覆盖。
+这是有意为之——排版产出常被人工补内容、调措辞，覆盖不可撤销，宁可多出一个文件。
+
 **Q：能批量排吗？**
 可以，一次给多个文件路径。每份都会单独确认要素。
 
@@ -227,7 +236,15 @@ python3 scripts/generate_gongwen.py --title "关于XXX的请示" --recipient "XX
 
 # 字体自检
 python3 scripts/generate_gongwen.py --check-fonts
+
+# 输出文件已存在时的处理（默认 rename）
+python3 scripts/generate_gongwen.py --config content.json --output 公文.docx \
+    --on-exist fail        # 碰到同名文件就停止（退出码 2）
+python3 scripts/generate_gongwen.py --config content.json --output 公文.docx \
+    --on-exist overwrite   # 明确覆盖同名文件
 ```
+
+退出码：`0` 成功；`1` 参数/内容错误；`2` 输出文件已存在且策略为 `fail`；`3` 无法写入（文件正被 Word/WPS 打开或无权限）。
 
 `content.json` 结构（角色必须显式指定）：
 
@@ -248,6 +265,7 @@ python3 scripts/generate_gongwen.py --check-fonts
   "signature": "发文机关署名",
   "date": "2026年3月17日",
   "page_number": "center",
+  "on_exist": "rename",
   "output": "公文.docx"
 }
 ```
@@ -259,8 +277,13 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 ```python
 from scripts.generate_gongwen import build_document
-build_document(content_dict, '公文.docx')
+
+build_document(content_dict, '公文.docx')                        # 同名则自动另存 _2
+build_document(content_dict, '公文.docx', on_exist='overwrite')  # 明确覆盖
 ```
+
+`on_exist`：`rename`（默认，自动另存）/ `fail`（抛 `FileExistsError`）/ `overwrite`（覆盖）。
+返回值是**实际写入的路径**——重名另存时与原传入值不同，交付给用户前务必用返回值。
 
 ### 目录结构
 
