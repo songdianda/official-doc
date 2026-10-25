@@ -76,6 +76,22 @@ def set_line_spacing(paragraph, pt_value):
     spacing.set(qn('w:after'), '0')
 
 
+def _set_doc_grid(section, line_pitch_twips=560):
+    """声明行网格（GB/T 9704-2012 5.2.3：一般每面 22 行）。
+
+    只锁行距网格，不锁字符网格（type 用 lines 而非 linesAndChars）——
+    锁字符会强制每行字数，导致中英混排被拉伸变形。
+    linePitch 与正文固定行距取同一值，两者一致时不会产生冲突。
+    """
+    sectPr = section._sectPr
+    docGrid = sectPr.find(qn('w:docGrid'))
+    if docGrid is None:
+        docGrid = OxmlElement('w:docGrid')
+        sectPr.append(docGrid)
+    docGrid.set(qn('w:type'), 'lines')
+    docGrid.set(qn('w:linePitch'), str(line_pitch_twips))
+
+
 def set_first_line_indent(paragraph, chars=2):
     """首行缩进 chars 个字符。
 
@@ -241,6 +257,10 @@ def build_document(content, output_path):
     section.bottom_margin = Mm(35)
     section.left_margin = Mm(28)
     section.right_margin = Mm(26)
+
+    # 文档网格（5.2.3）：python-docx 默认模板残留学生 linePitch=360(18磅) 且缺 type，
+    # 需显式改写为 28 磅行网格（560 twips），与固定行距一致，避免 Word 各行版本解释不一致。
+    _set_doc_grid(section, line_pitch_twips=int(LINE_BODY * 20))
 
     # 标题：小标宋 二号 居中 行距32磅
     title_para = doc.add_paragraph()
