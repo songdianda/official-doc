@@ -290,19 +290,80 @@ def add_blank(doc, line_spacing=LINE_BODY):
     return para
 
 
+def _row_width(row, srow):
+    """行的逻辑列数：有合并信息时按 gridSpan 累加，否则按元素个数。"""
+    if not srow:
+        return len(row)
+    return sum(max(int((s or {}).get('h', 1) or 1), 1) for s in srow)
+
+
+def _apply_merges(table, spans, rows):
+    """还原合并单元格。
+
+    直接写 w:gridSpan / w:vMerge，不用 python-docx 的 cell.merge()：后者会把
+    被合并格的内容追加进来（这里被合并格是留空占位，追加后会留下多余空段落），
+    且合并后列索引随即错位。
+
+    每行内部**从右向左**处理：gridSpan 要删掉后续 tc，右侧先删才不会让
+    左侧的索引失效。纵向合并只加属性、不动 tc，顺序无所谓。
+    """
+    for ri, srow in enumerate(spans or []):
+        if ri >= len(rows):
+            break
+        items, c = [], 0
+        for span in srow or []:
+            s = span or {}
+            colspan = max(int(s.get('h', 1) or 1), 1)
+            items.append((c, colspan, s.get('v')))
+            c += colspan
+        for c, colspan, vmerge in reversed(items):
+            try:
+                cell = table.cell(ri, c)
+            except (IndexError, ValueError):
+                continue
+            tcPr = cell._tc.get_or_add_tcPr()
+            # gridSpan / vMerge 必须排在 vAlign 之前（CT_TcPr 的 schema 顺序），
+            # 而 vAlign 是填内容时先写进去的，所以这里用 insert 而非 append
+            va = tcPr.find(qn('w:vAlign'))
+            pos = list(tcPr).index(va) if va is not None else len(tcPr)
+            if colspan > 1:
+                gs = OxmlElement('w:gridSpan')
+                gs.set(qn('w:val'), str(colspan))
+                tcPr.insert(pos, gs)
+                pos += 1
+                # 删掉本行被吞掉的后续 tc，否则行内列数会超出表格列数
+                tr = cell._tc.getparent()
+                idx = list(tr).index(cell._tc)
+                for _ in range(colspan - 1):
+                    if idx + 1 < len(tr) and tr[idx + 1].tag == qn('w:tc'):
+                        del tr[idx + 1]
+            if vmerge in ('restart', 'continue'):
+                vm = OxmlElement('w:vMerge')
+                vm.set(qn('w:val'), vmerge)
+                tcPr.insert(pos, vm)
+
+
 def add_table(doc, rows, header=True, font_name=None,
-              size_header=12, size_body=10.5, align='center'):
+              size_header=12, size_body=10.5, align='center',
+              spans=None, ncol=None):
     """插入附表。
 
     国标未对附表字号作强制规定，通行做法是小四（12磅）表头 + 五号（10.5磅）
     数据，字体随正文用仿宋，整体居中并加边框。数据与表头均居中对齐。
 
     rows: 二维列表，第一行在 header=True 时视为表头。
+    spans: 与 rows 同形的合并信息，由 inspect_docx.py 从 gridSpan/vMerge 解析；
+           被合并覆盖的位置在 rows 中为 ''，由 _apply_merges 还原成真正的合并格。
+    ncol: 表格逻辑列数（有横向合并时大于 len(rows[i])）。
     """
     font_name = font_name or FONT_BODY
     if not rows:
         return None
-    ncol = max(len(r) for r in rows)
+    if not ncol:
+        ncol = max((_row_width(rows[i], spans[i] if spans and i < len(spans) else None)
+                    for i in range(len(rows))), default=0)
+    if ncol <= 0:
+        return None
     table = doc.add_table(rows=0, cols=ncol)
     try:
         table.style = 'Table Grid'      # 全线边框
@@ -319,23 +380,32 @@ def add_table(doc, rows, header=True, font_name=None,
 
     for ri, row in enumerate(rows):
         cells = table.add_row().cells
+        srow = spans[ri] if spans and ri < len(spans) else None
         is_header = header and ri == 0
         size = size_header if is_header else size_body
-        for ci in range(ncol):
-            text = row[ci] if ci < len(row) else ''
+        ci = 0                      # 逻辑列游标，按 gridSpan 推进
+        for j, text in enumerate(row):
+            if ci >= ncol:
+                break
+            span = (srow[j] if srow and j < len(srow) else None) or {}
+            colspan = max(int(span.get('h', 1) or 1), 1)
             cell = cells[ci]
             # 新建单元格自带一个空段落，直接取用即可；
             # clear_content() 会把这个段落也删掉，导致 paragraphs[0] 越界。
             para = cell.paragraphs[0]
             para.alignment = para_align
             set_line_spacing(para, 16 if is_header else 14)
-            run = para.add_run(str(text))
+            run = para.add_run(str(text or ''))
             set_font(run, font_name, size, bold=is_header)
             # 垂直居中
             tcPr = cell._tc.get_or_add_tcPr()
             va = OxmlElement('w:vAlign')
             va.set(qn('w:val'), 'center')
             tcPr.append(va)
+            ci += colspan
+
+    if spans:
+        _apply_merges(table, spans, rows)
     return table
 
 
@@ -439,7 +509,13 @@ def add_page_number(section, mode=PAGE_NUMBER_DEFAULT):
     settings = section.part.document.settings.element
     if settings.find(qn('w:evenAndOddHeaders')) is None:
         flag = OxmlElement('w:evenAndOddHeaders')
-        settings.insert(0, flag)
+        # CT_Settings 子元素有 schema 顺序：evenAndOddHeaders 位于 rsids 之前。
+        # 直接 insert(0) 插到最前面 Word 多半容忍，但严格解析器会判不合规。
+        rsids = settings.find(qn('w:rsids'))
+        if rsids is not None:
+            rsids.addprevious(flag)
+        else:
+            settings.append(flag)
 
     # 2) 奇数页页脚（default）：居右空一字
     footer_odd = section.footer
@@ -474,14 +550,24 @@ def build_document(content, output_path):
     content 支持字段：
       title       标题（必填）
       recipient   主送机关，如「省人民政府：」（可选）
-      body        正文列表，元素可为字符串（自动识别层级）或
-                  {"type": "text"|"level1".."level5"|"blank", "text": "..."}
+      body        正文列表，元素可为字符串（兜底识别）或
+                  {"type": "heading1".."heading5"|"body"|"numbered_body"
+                          |"blank"|"table", "text": "..."}
+                  {"type": "table", "index": 0} 为附表占位
+      tables      附表列表 [{"rows": [...], "header": true,
+                             "spans": [...], "ncol": 3}]
       attachments 附件名称列表（可选）
       signature   发文机关署名（可选）
       date        成文日期（可选）
-      page_number 页码样式：center（默认，居中）/ odd_even（奇偶页不同）/ none（不显示）
+      page_number 页码样式：center（无源文件时默认，居中）/
+                  odd_even（奇偶页不同）/ none（不显示）
+                  有源文件时由 inspect_docx.py 按源文档推断
       output      输出路径（可选，优先级低于 output_path 参数）
     """
+    title = (content.get('title') or '').strip()
+    if not title:
+        raise ValueError('缺少 title：公文标题为必填项，'
+                         '请传 --title 或在 content 中设置 title')
     doc = Document()
 
     # 字体回退：把国标字体名换成本机实际可用的等效字体
@@ -504,7 +590,7 @@ def build_document(content, output_path):
     title_para = doc.add_paragraph()
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     set_line_spacing(title_para, LINE_TITLE)
-    title_run = title_para.add_run(content['title'])
+    title_run = title_para.add_run(title)
     set_font(title_run, FONT_TITLE, SIZE_TITLE)
 
     add_blank(doc)
@@ -533,8 +619,13 @@ def build_document(content, output_path):
                 t = tables[idx]
                 add_table(doc, t.get('rows', []),
                           header=t.get('header', True),
-                          align=t.get('align', 'center'))
+                          align=t.get('align', 'center'),
+                          spans=t.get('spans'), ncol=t.get('ncol'))
                 used_tables.add(idx)
+            else:
+                # 静默跳过等于丢内容，必须出声
+                print(f'警告：body 引用了表格 index={idx}，'
+                      f'但 tables 只有 {len(tables)} 个，该表格未输出')
             continue
 
         text, role = resolve_role(item)
@@ -583,7 +674,8 @@ def build_document(content, output_path):
             add_blank(doc)
             add_table(doc, t.get('rows', []),
                       header=t.get('header', True),
-                      align=t.get('align', 'center'))
+                      align=t.get('align', 'center'),
+                      spans=t.get('spans'), ncol=t.get('ncol'))
 
     # 页码
     mode = resolve_page_number_mode(content.get('page_number'))

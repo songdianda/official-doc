@@ -35,7 +35,12 @@ NUM_PREFIX = [
 
 # 样式名 -> 层级（中英文 Word 常见写法）
 STYLE_HEADING = re.compile(r'(?:heading|标题|heading)\s*(\d)', re.I)
-TERMINAL_PUNCT = '。；；！？'
+TERMINAL_PUNCT = '。；！？'
+
+# 成文日期（7.3.5.4：阿拉伯数字标全年月日）。整段仅为日期时几乎必然是落款日期。
+DATE_FULL = re.compile(r'^\d{4}年\d{1,2}月\d{1,2}日$')
+# 附件说明（7.3.4）。
+ATTACH_PREFIX = re.compile(r'^附件[:：]')
 
 
 CN_DIGITS = '零一二三四五六七八九十'
@@ -315,6 +320,69 @@ def detect_page_number(doc):
     return {'found': True, 'mode': mode, 'detail': detail}
 
 
+def extract_table(tbl):
+    """提取表格并保留合并单元格结构。
+
+    python-docx 的 row.cells 会把横向合并的格子按物理列重复展开——一个跨 2 列的
+    「300」会被读成 ['300', '300']，照搬进新表就凭空多出一个不存在的数值。
+    这里解析 w:gridSpan / w:vMerge：被合并覆盖的位置一律留空，跨度记在 spans 里，
+    由生成器真正执行单元格合并。
+
+    返回 (rows, spans, ncol)。spans[i][j] 为 None 或
+    {'h': 横向跨列数} / {'v': 'restart'|'continue'}。
+    """
+    rows, spans = [], []
+    in_merge = {}       # 逻辑列 -> 上一行该列是否处于纵向合并中
+    for tr in tbl._tbl.findall(qn('w:tr')):
+        row, srow = [], []
+        ci, recorded = 0, []
+        for tc in tr.findall(qn('w:tc')):
+            tcPr = tc.find(qn('w:tcPr'))
+            colspan, vmerge = 1, None
+            if tcPr is not None:
+                gs = tcPr.find(qn('w:gridSpan'))
+                if gs is not None:
+                    try:
+                        colspan = max(int(gs.get(qn('w:val')) or 1), 1)
+                    except (TypeError, ValueError):
+                        colspan = 1
+                vm = tcPr.find(qn('w:vMerge'))
+                if vm is not None:
+                    val = vm.get(qn('w:val'))
+                    # ST_Merge 的缺省值是 continue：Word 常给后续格写 <w:vMerge/>
+                    # 而不带 val，按"非 continue 即 restart"判会把续行误判成新起点。
+                    # 仅当上一行同列并未处于合并中时，孤立的省略式才按 restart 处理。
+                    if val == 'restart':
+                        vmerge = 'restart'
+                    elif val == 'continue':
+                        vmerge = 'continue'
+                    else:
+                        vmerge = 'continue' if in_merge.get(ci) else 'restart'
+            text = ''.join(t.text or '' for t in tc.iter(qn('w:t'))).strip()
+            if vmerge == 'continue':
+                row.append('')            # 内容已在上一行同列，此处留空
+                srow.append({'v': 'continue'})
+            else:
+                row.append(text)
+                span = {}
+                if colspan > 1:
+                    span['h'] = colspan
+                if vmerge == 'restart':
+                    span['v'] = 'restart'
+                srow.append(span or None)
+            recorded.append((ci, vmerge))
+            ci += colspan
+        rows.append(row)
+        spans.append(srow)
+        in_merge = {c: True for c, v in recorded if v is not None}
+
+    def width(srow):
+        return sum((s or {}).get('h', 1) for s in srow)
+
+    ncol = max((width(srow) for srow in spans), default=0)
+    return rows, spans, ncol
+
+
 def build(path):
     doc = Document(path)
 
@@ -351,22 +419,79 @@ def build(path):
                                       'bullet': info['bullet']})
             order.append(('para', len(paras) - 1))
         else:
-            rows = [[c.text.strip() for c in row.cells] for row in obj.rows]
-            tables.append({'rows': rows, 'header': True})
+            rows, spans, ncol = extract_table(obj)
+            entry = {'rows': rows, 'header': True, 'ncol': ncol}
+            # 只有真存在合并单元格时才写 spans，保持 JSON 简洁
+            if any(s for srow in spans for s in srow):
+                entry['spans'] = spans
+            tables.append(entry)
             order.append(('table', len(tables) - 1))
 
-    # 约定：首段为标题，只进 title 字段，不进 body（否则会重复输出一次）
+    # ── 结构性要素 ──────────────────────────────────────────
+    # 标题、署名、成文日期由生成器单独输出，留在 body 里会出现两次。
+    # 标题取**首个非空段落**：公文标题上方常有空行或文号行，写死首段会取到空串，
+    # 还会把真正的标题当正文排一遍。
+    title_idx = next((i for i, s in enumerate(paras) if s['text'].strip()), None)
+
+    # 成文日期：整段仅为「2026年3月17日」时几乎必然是落款日期
+    date_idx = None
+    for i in range(len(paras) - 1, -1, -1):
+        if i != title_idx and DATE_FULL.match(paras[i]['text'].strip()):
+            date_idx = i
+            break
+    # 署名：落款日期之上最近的非空短段（机关名一般不以句号结尾）
+    sig_idx = None
+    if date_idx is not None:
+        for j in range(date_idx - 1, -1, -1):
+            t = paras[j]['text'].strip()
+            if not t or j == title_idx:
+                continue
+            if len(t) <= 40 and t[-1] not in TERMINAL_PUNCT + '，,、':
+                sig_idx = j
+            break
+    dropped = {i for i in (title_idx, sig_idx, date_idx) if i is not None}
+    # 落款块前后的空段落一并清掉：源文件里那些用来把落款"顶下去"的空行，
+    # 生成器会在落款前后各补一个空行，留着就是一堆空段落噪音
+    anchor = sig_idx if sig_idx is not None else date_idx
+    if anchor is not None:
+        j = anchor - 1
+        while j >= 0 and j != title_idx and not paras[j]['text'].strip():
+            dropped.add(j)
+            j -= 1
+        for j in range((date_idx if date_idx is not None else anchor) + 1, len(paras)):
+            if not paras[j]['text'].strip():
+                dropped.add(j)
+            else:
+                break
+
+    # 主送机关 / 附件说明：误判代价高（删了就丢内容），**只提候选不自动剥离**
     body = []
     uncertain = []
+    candidates = []
+    seen_first = False
+
     for kind, i in order:
         if kind == 'table':
             body.append({'type': 'table', 'index': i})
             continue
         sig = paras[i]
-        if sig['index'] == 0:
-            continue        # 首段已作 title
+        if i in dropped:
+            continue
+        text = sig['text']
+        if (not seen_first and text.strip() and title_idx is not None
+                and i > title_idx):
+            seen_first = True
+            if text.rstrip().endswith('：') and len(text) <= 40:
+                candidates.append({
+                    'field': 'recipient', 'index': i, 'text': text,
+                    'note': '疑似主送机关；确认后填入 recipient，并删除 body 中该段'})
+        elif ATTACH_PREFIX.match(text.strip()):
+            candidates.append({
+                'field': 'attachments', 'index': i, 'text': text,
+                'note': '疑似附件说明；确认后填入 attachments，并删除 body 中该段'})
+
         role, conf, reason = suggest(sig)
-        item = {'type': role, 'text': sig['text']}
+        item = {'type': role, 'text': text}
         item['_src'] = {
             'index': sig['index'],
             'style': sig['style'],
@@ -382,7 +507,7 @@ def build(path):
             uncertain.append({'index': sig['index'], 'text': sig['text'][:60],
                               'suggested': role, 'reason': reason})
 
-    title = paras[0]['text'] if paras and paras[0]['text'] else ''
+    title = paras[title_idx]['text'].strip() if title_idx is not None else ''
 
     # 页码：源文档没有就不加，有则沿用原样式
     pn = detect_page_number(doc)
@@ -392,12 +517,27 @@ def build(path):
         'page_number': pn['mode'],
         'body': body,
         '_uncertain': uncertain,
-        '_note': ('_src 与 _uncertain 为判读线索，可删除；'
+        '_note': ('_src / _uncertain / _candidates 为判读线索，可删除；'
                   'type 定稿后交给 generate_gongwen.py。'
                   '表格保留在 tables，body 中的 {"type":"table"} 决定其位置。'
                   'page_number 由源文档页码自动推断：'
-                  '源文件无页码→none，有→沿用 center/odd_even。'),
+                  '源文件无页码→none，有→沿用 center/odd_even。'
+                  '标题取首个非空段落；落款署名与成文日期已从 body 剥离'
+                  '（见 signature / date / _stripped），避免重复输出。'),
     }
+    if sig_idx is not None:
+        result['signature'] = paras[sig_idx]['text'].strip()
+    if date_idx is not None:
+        result['date'] = paras[date_idx]['text'].strip()
+    stripped = []
+    for i, field in ((sig_idx, 'signature'), (date_idx, 'date')):
+        if i is not None:
+            stripped.append({'index': i, 'field': field,
+                             'text': paras[i]['text'].strip()})
+    if stripped:
+        result['_stripped'] = stripped
+    if candidates:
+        result['_candidates'] = candidates
     if pn['detail']:
         result['_page_number'] = pn['detail']
     if auto_numbered:
@@ -447,6 +587,20 @@ def main():
             for a in an:
                 print(f'   第{a["index"]}段 → 「{a["text"]}」'
                       f'（{a["fmt"]}，值={a["value"]}）')
+        if result.get('signature') or result.get('date'):
+            print('落款：已从正文剥离（生成器会重新输出，留在正文里会重复） → '
+                  f"署名「{result.get('signature') or '（无）'}」"
+                  f" 日期「{result.get('date') or '（无）'}」，见 _stripped")
+        cand = result.get('_candidates') or []
+        if cand:
+            print(f'候选要素 {len(cand)} 处（误判代价高，未自动剥离，请确认）：')
+            for c in cand:
+                print(f"   第{c['index']}段 → {c['field']}：{c['text'][:30]}")
+        tabs = result.get('tables') or []
+        if tabs:
+            merged = sum(1 for t in tabs if t.get('spans'))
+            extra = f'，其中 {merged} 个含合并单元格（已保留合并结构）' if merged else ''
+            print(f'表格：{len(tabs)} 个{extra}')
     else:
         print(text)
     return 0
