@@ -38,6 +38,22 @@ SIZE_PAGE = 14                     # 四号
 LINE_TITLE = 32                    # 标题行距（磅，固定值）
 LINE_BODY = 28                     # 正文行距（磅，固定值）
 
+# ── 字体回退链 ───────────────────────────────────────────
+# 国标字体名在不同系统上实际名称不同：Windows 常见「仿宋_GB2312」，
+# macOS 通常只有「方正仿宋_GBK」「华文仿宋」，Linux 多用「FangSong」。
+# 若写死国标名而本机没有，Word 会静默回退到默认字体，导致格式走样。
+# 这里按「国标名 → 等效字体 → 通用兜底」逐项回退，取本机第一个可用的。
+FONT_CHAINS = {
+    'title': ['方正小标宋简体', '小标宋体', '方正小标宋_GBK', '华文中宋',
+              'STZhongsong', '宋体-简', '宋体'],
+    'body':  ['仿宋_GB2312', '方正仿宋_GBK', '方正仿宋', '华文仿宋',
+              '仿宋', 'FangSong', '宋体'],
+    'kai':   ['楷体_GB2312', '楷体-简', '华文楷体', '楷体', 'Kai',
+              'Kaiti SC', '宋体'],
+    'hei':   ['黑体', '黑体-简', '华文黑体', 'Hei', 'Heiti SC', 'SimHei'],
+    'page':  ['宋体', '宋体-简', '华文宋体', 'SimSun', 'Songti SC'],
+}
+
 # 层级识别：编号前缀 -> (字体, 是否加粗)
 LEVEL_PATTERNS = [
     (re.compile(r'^[一二三四五六七八九十]+、'), FONT_HEI, False),      # 一、
@@ -46,6 +62,84 @@ LEVEL_PATTERNS = [
     (re.compile(r'^（\d+）'), FONT_BODY, True),                      # （1）
     (re.compile(r'^[①-⑳]'), FONT_BODY, True),                        # ①
 ]
+
+
+# ── 字体可用性检测与回退 ─────────────────────────────────
+
+_font_cache = None
+
+
+def available_fonts():
+    """列出本机可用字体名集合。检测失败时返回空集合（此时不回退，保留国标名）。"""
+    global _font_cache
+    if _font_cache is not None:
+        return _font_cache
+    import subprocess
+    names = set()
+    try:
+        if sys.platform == 'darwin':
+            out = subprocess.run(['system_profiler', 'SPFontsDataType'],
+                                 capture_output=True, text=True, timeout=90).stdout
+            names = set(m.strip() for m in re.findall(r'^\s*Family:\s*(.+)$', out, re.M))
+        elif sys.platform.startswith('linux'):
+            out = subprocess.run(['fc-list', ':', 'family'],
+                                 capture_output=True, text=True, timeout=30).stdout
+            for line in out.splitlines():
+                names.update(f.strip() for f in line.split(','))
+        elif sys.platform == 'win32':
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts')
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumValue(key, i)[0]
+                    names.add(re.sub(r'\s*\((?:TrueType|OpenType|All res)\)\s*$',
+                                     '', name))
+                    i += 1
+                except OSError:
+                    break
+    except Exception:
+        names = set()
+    _font_cache = names
+    return names
+
+
+def resolve_fonts():
+    """返回 {role: 本机实际可用的字体名}。"""
+    avail = available_fonts()
+    resolved = {}
+    for role, chain in FONT_CHAINS.items():
+        resolved[role] = next((f for f in chain if f in avail), chain[0])
+    return resolved
+
+
+def apply_font_fallback():
+    """把模块级字体常量改写为回退链中本机第一个可用的字体，并重建层级规则。
+
+    返回 {role: (国标名, 实际使用名)}，便于向用户报告替换情况。
+    """
+    global FONT_TITLE, FONT_BODY, FONT_KAI, FONT_HEI, FONT_PAGE
+
+    resolved = resolve_fonts()
+    before = {'title': FONT_TITLE, 'body': FONT_BODY, 'kai': FONT_KAI,
+              'hei': FONT_HEI, 'page': FONT_PAGE}
+    FONT_TITLE = resolved['title']
+    FONT_BODY = resolved['body']
+    FONT_KAI = resolved['kai']
+    FONT_HEI = resolved['hei']
+    FONT_PAGE = resolved['page']
+
+    # LEVEL_PATTERNS 在模块加载时已固化旧字体名，原地重建
+    LEVEL_PATTERNS[:] = [
+        (re.compile(r'^[一二三四五六七八九十]+、'), FONT_HEI, False),      # 一、
+        (re.compile(r'^（[一二三四五六七八九十]+）'), FONT_KAI, False),    # （一）
+        (re.compile(r'^\d+\.'), FONT_BODY, True),                        # 1.
+        (re.compile(r'^（\d+）'), FONT_BODY, True),                      # （1）
+        (re.compile(r'^[①-⑳]'), FONT_BODY, True),                        # ①
+    ]
+    return {r: (before[r], resolved[r]) for r in resolved}
 
 
 # ── 基础排版函数 ─────────────────────────────────────────
@@ -133,16 +227,18 @@ def set_left_indent_chars(paragraph, chars=1):
     ind.set(qn('w:left'), str(chars * 320))
 
 
-def add_paragraph(doc, text, font_name=FONT_BODY, font_size=SIZE_BODY,
+def add_paragraph(doc, text, font_name=None, font_size=SIZE_BODY,
                   bold=False, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
                   indent=True, line_spacing=LINE_BODY):
+    # font_name 默认 None：不能在签名里写 FONT_BODY，默认参数在定义时就绑定，
+    # 字体回退改写 FONT_BODY 后不会生效。
     para = doc.add_paragraph()
     para.alignment = align
     set_line_spacing(para, line_spacing)
     if indent:
         set_first_line_indent(para, 2)
     run = para.add_run(text)
-    set_font(run, font_name, font_size, bold)
+    set_font(run, font_name or FONT_BODY, font_size, bold)
     return para
 
 
@@ -249,6 +345,9 @@ def build_document(content, output_path):
     """
     doc = Document()
 
+    # 字体回退：把国标字体名换成本机实际可用的等效字体
+    font_report = apply_font_fallback()
+
     # 页面设置（5.2.1）
     section = doc.sections[0]
     section.page_width = Mm(210)
@@ -349,31 +448,37 @@ def build_document(content, output_path):
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     doc.save(out)
+
+    changed = {k: v for k, v in font_report.items() if v[0] != v[1]}
+    if changed:
+        print('字体回退：本机缺少国标字体，已自动替换为等效字体')
+        for role, (old, new) in changed.items():
+            print(f'  {old} → {new}')
+        print('  （在装有国标字体的机器上生成则不会发生替换）')
     return out
 
 
 # ── 字体自检 ─────────────────────────────────────────────
 
+ROLE_LABEL = {'title': '标题', 'body': '正文/主送机关', 'kai': '第二层',
+              'hei': '第一层', 'page': '页码'}
+
+
 def check_fonts():
-    """检查运行环境是否安装公文所需字体。macOS / Linux 可用。"""
-    required = [FONT_TITLE, FONT_BODY, FONT_KAI, FONT_HEI, FONT_PAGE]
-    if sys.platform == 'darwin':
-        import subprocess
-        try:
-            out = subprocess.run(['system_profiler', 'SPFontsDataType'],
-                                 capture_output=True, text=True, timeout=30).stdout
-        except Exception:
-            return None
-        return {f: (f in out) for f in required}
-    if sys.platform.startswith('linux'):
-        import subprocess
-        try:
-            out = subprocess.run(['fc-list', ':lang=zh'],
-                                 capture_output=True, text=True, timeout=30).stdout
-        except Exception:
-            return None
-        return {f: (f in out) for f in required}
-    return None
+    """检查本机字体，并报告每个用途的回退链与最终选用的字体。"""
+    avail = available_fonts()
+    if not avail:
+        return None          # 检测失败，无法判断
+    resolved = resolve_fonts()
+    report = {}
+    for role, chain in FONT_CHAINS.items():
+        report[role] = {
+            'label': ROLE_LABEL[role],
+            'chain': chain,
+            'picked': resolved[role],
+            'exact': resolved[role] == chain[0],   # 是否命中国标名
+        }
+    return report
 
 
 # ── CLI ─────────────────────────────────────────────────
@@ -396,9 +501,15 @@ def main():
         if result is None:
             print('当前平台不支持自动字体检测，请手动确认已安装：'
                   '方正小标宋简体、仿宋_GB2312、楷体_GB2312、黑体、宋体')
+            print('（未检测到字体清单时不会做回退替换，仍按国标名写入）')
         else:
-            for name, ok in result.items():
-                print(f'{"✓" if ok else "✗"} {name}')
+            for role in FONT_CHAINS:
+                r = result[role]
+                mark = '✓' if r['exact'] else '↷'
+                print(f"{mark} {r['label']}：实际使用「{r['picked']}」")
+                if not r['exact']:
+                    print(f"    国标名「{r['chain'][0]}」本机没有，"
+                          f"已回退；回退链 {' → '.join(r['chain'])}")
         return 0
 
     if args.config:

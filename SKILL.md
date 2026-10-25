@@ -13,7 +13,7 @@ examples_en:
   - "Format this meeting minutes into a standard official Word document"
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
-version: 1.0.0
+version: 1.1.0
 author: songdianda
 ---
 
@@ -86,7 +86,7 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 - **不编造内容**：单位名称、文号、日期、金额、人名等一律向用户确认，缺失就问，不填充占位式臆测数据。
 - **不擅自改意**：编号修正只改编号格式，不改文字表述；拿不准的先问。
-- **字体不打包**：本技能不含字体文件。字体受著作权保护，商用需自行取得授权。生成前用 `--check-fonts` 确认，未安装时明确告知用户。
+- **字体不打包，但会自动回退**：本技能不含字体文件（字体受著作权保护，商用需自行取得授权）。脚本内置回退链，本机缺少国标字体时自动选用等效字体并打印替换情况（`方正小标宋简体→宋体-简`、`仿宋_GB2312→方正仿宋_GBK` 等）。生成后须把实际使用的字体告知用户；若标题被回退到普通宋体，应提示"标题非小标宋，装在装了国标字体的机器上效果更好"。
 - **只输出 .docx**：不生成 PDF、不生成图片版式。
 - **输出位置**：默认当前工作目录，文件名由用户指定。
 
