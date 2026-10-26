@@ -1236,7 +1236,7 @@ def _vrecord_probes(marker):
     长串用来避免误命中正文（正文里也可能出现「XX师范大学」）；
     短串用来兜底两种情况：PDF 里这一行可能被拆成两块（印发机关一块、
     印发日期一块），以及版记被推到新一页时 PyMuPDF 抽文字会掉字
-    （实测「XX师范大学党政办公室」抽成「宁师范大学党政办公室辽」，
+    （实测「XX师范大学党政办公室」抽成「X师范大学党政办公室X」，
     前 4 个字全废，只有中段的「党政办公室」仍然完整）。
     """
     m = re.sub(r'\s', '', marker or '')
@@ -1720,7 +1720,7 @@ def build_document(content, output_path, on_exist=None):
 
     content 支持字段：
       title       标题（必填）
-      recipient   主送机关，如「省人民政府：」（可选）
+      recipient   主送机关，如「XX省人民政府：」（可选）
       body        正文列表，元素可为字符串（兜底识别）或
                   {"type": "heading1".."heading5"|"body"|"numbered_body"
                           |"blank"|"table", "text": "..."}

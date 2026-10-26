@@ -15,7 +15,7 @@ examples_en:
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
   - "Reformat this request with an attached table, keeping the original page numbering"
-version: 1.17.0
+version: 1.17.1
 author: songdianda
 user-invocable: true
 ---
