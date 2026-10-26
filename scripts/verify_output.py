@@ -42,6 +42,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from docx import Document                      # noqa: E402
 from docx.oxml.ns import qn                    # noqa: E402
 
+# VML 命名空间不在 python-docx 的 nsmap 里，qn('v:line') 会 KeyError
+VML_NS = 'urn:schemas-microsoft-com:vml'
+
+
+def _vml(tag):
+    return '{%s}%s' % (VML_NS, tag)
+
 # 只复用纯 XML 工具函数，不复用提取逻辑——验收必须独立于被验收的对象
 from inspect_docx import extract_table         # noqa: E402
 
@@ -63,9 +70,42 @@ def _all_text(el):
 # ── 图片计数 ─────────────────────────────────────────────
 
 def _count_images(el):
-    """XML 元素里的图片引用数（w:drawing / 老式 w:pict）。"""
-    return (sum(1 for _ in el.iter(qn('w:drawing')))
-            + sum(1 for _ in el.iter(qn('w:pict'))))
+    """XML 元素里的**位图**引用数。
+
+    只数真正引用了图片文件的元素：DrawingML 的 a:blip 带 r:embed，
+    或老式 VML 的 v:imagedata 带 r:id。红头分隔线、版记线这类 v:line /
+    v:shape 是矢量图形，没有位图文件，不能算图片——把它们数进来会报出
+    「正文图片少 4 个」这种假警报（实测样本：源 6 / 成品 2，实际一张
+    位图都没丢，少的全是 VML 线条）。
+    """
+    n = 0
+    for blip in el.iter(qn('a:blip')):
+        if blip.get(qn('r:embed')) or blip.get(qn('r:link')):
+            n += 1
+    for im in el.iter(_vml('imagedata')):
+        if im.get(qn('r:id')):
+            n += 1
+    return n
+
+
+def _is_page_number(el):
+    """元素里是否含 PAGE 域（页码）。
+
+    页脚里常同时存在域代码和上次渲染的缓存数字（如「8」），把缓存值当
+    正文比会误报「页眉页脚文字未进入成品」——成品有同一个域，只是缓存
+    值不同。页码由专门的那一道检查负责。
+    """
+    for t in el.iter(qn('w:instrText')):
+        if 'PAGE' in (t.text or '').upper():
+            return True
+    return False
+
+
+def _count_shapes(el):
+    """矢量图形数（分隔线、版记线、形状框），与位图分开报。"""
+    tags = tuple(_vml(t) for t in
+                 ('line', 'shape', 'rect', 'oval', 'roundrect'))
+    return sum(1 for node in el.iter() if node.tag in tags)
 
 
 def _classify(doc):
@@ -99,6 +139,7 @@ def image_stats(path):
     doc = Document(path)
     zones = _classify(doc)
     stats = {k: sum(_count_images(el) for el in v) for k, v in zones.items()}
+    stats['shapes'] = sum(_count_shapes(el) for el in zones['body'])
     # 去重后的图片文件数（同一张图在多个页眉被引用时只算一份）
     stats['files'] = len({str(p.partname) for p in doc.part.package.parts
                           if '/media/' in str(p.partname)})
@@ -134,7 +175,8 @@ def raw_source(path):
 
     for el in _classify(doc)['header_footer']:
         text = _all_text(el)
-        if text:
+        # 页码域的缓存值（页脚里那个「8」）不是内容，页码单独比对
+        if text and not _is_page_number(el):
             items.append({'text': text, 'where': '页眉/页脚',
                           'zone': '页眉页脚'})
     for el in _classify(doc)['other']:

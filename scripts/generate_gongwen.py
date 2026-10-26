@@ -72,13 +72,21 @@ ROLE_STYLES = {
     'heading5': ('body', True),        # ①         仿宋加粗
     'body': ('body', False),           # 普通正文
     'numbered_body': ('body', False),  # 编号正文：保留编号，按正文排，不加粗
+    # 附件标题：附件另页起排时那一行标题，二号小标宋居中（GB/T 9704-2012 7.3.7）。
+    # 印发类通知（"现将《XXX办法》印发给你们"）后面几乎都跟着一份附件，
+    # 原来只能拿 heading3（仿宋加粗）凑，跟源文件二号小标宋居中差得远。
+    'attachment_title': ('title', False),
 }
+
+# 居中排的角色：正文类角色一侓两端对齐，只有附件标题要居中
+CENTER_ROLES = {'attachment_title'}
 
 # 旧字段名兼容
 ROLE_ALIASES = {
     'level1': 'heading1', 'level2': 'heading2', 'level3': 'heading3',
     'level4': 'heading4', 'level5': 'heading5',
     'text': 'body', 'para': 'body', 'plain': 'body',
+    'attachment': 'attachment_title', 'attachment_name': 'attachment_title',
 }
 
 # 兜底自动识别：仅在元素是字符串（未显式指定角色）时使用。
@@ -1253,7 +1261,8 @@ def build_document(content, output_path, on_exist=None):
         set_font(rec_run, FONT_BODY, SIZE_BODY)
 
     # 正文
-    font_by_role = {'hei': FONT_HEI, 'kai': FONT_KAI, 'body': FONT_BODY}
+    font_by_role = {'hei': FONT_HEI, 'kai': FONT_KAI, 'body': FONT_BODY,
+                    'title': FONT_TITLE}
     tables = content.get('tables') or []
     used_tables = set()
 
@@ -1284,6 +1293,17 @@ def build_document(content, output_path, on_exist=None):
             continue
         font_role, bold = ROLE_STYLES[role]
         pag = item if isinstance(item, dict) else {}
+        if role in CENTER_ROLES:
+            # 附件标题：二号小标宋居中，用标题行距，不首行缩进
+            para = doc.add_paragraph()
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            set_line_spacing(para, LINE_TITLE)
+            run = para.add_run(text)
+            set_font(run, font_by_role[font_role], SIZE_TITLE)
+            set_pagination(para, bool(pag.get('keep_next')),
+                           bool(pag.get('keep_lines')),
+                           bool(pag.get('page_break_before')))
+            continue
         add_paragraph(doc, text, font_name=font_by_role[font_role], bold=bold,
                       keep_next=bool(pag.get('keep_next')),
                       keep_lines=bool(pag.get('keep_lines')),

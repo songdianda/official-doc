@@ -344,6 +344,26 @@ def resolve_fidelity(value):
     return key if key in FIDELITY_MODES else None
 
 
+# w:jc 的合法取值不止 python-docx 枚举认识的那几个。LibreOffice 转出的
+# docx 会写 start / end（OOXML 严格版的写法），直接读 p.alignment 会抛
+# ValueError。取值只作线索用，统一归到 familiar 的几个名字上即可。
+JC_ALIASES = {'start': 'left', 'end': 'right', 'both': 'justify'}
+
+
+def safe_alignment(p):
+    """读段落对齐，遇到不认识的 w:jc 值也不崩。"""
+    pPr = p._element.pPr
+    if pPr is None:
+        return None
+    jc = pPr.find(qn('w:jc'))
+    if jc is None:
+        return None
+    val = jc.get(qn('w:val'))
+    if not val:
+        return None
+    return JC_ALIASES.get(val, val)
+
+
 def para_signals(p, index, auto_prefix=None, auto_info=None):
     """采集一段的样式线索。auto_prefix 为 Word 自动编号渲染出的文本。
 
@@ -379,7 +399,7 @@ def para_signals(p, index, auto_prefix=None, auto_info=None):
         'font': (rFonts.get(qn('w:eastAsia')) if rFonts is not None else None),
         'listPara': numPr,          # Word 自动编号/项目符号
         'autoNumber': auto_info,    # 自动编号线索（由 numbering.xml 算出，非原文字符）
-        'alignment': str(p.alignment) if p.alignment is not None else None,
+        'alignment': safe_alignment(p),
     }
 
 
@@ -620,9 +640,26 @@ def _textbox_text(el):
 # 数学公式命名空间（m:），python-docx 的 nsmap 里没有，需手写
 M_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
 
+# VML（老式图形 w:pict 里的 v:line / v:shape / v:imagedata），同样不在 nsmap。
+# 直接写 qn('v:line') 会抛 KeyError: 'v'。
+VML_NS = 'urn:schemas-microsoft-com:vml'
+
 
 def _m(tag):
     return '{%s}%s' % (M_NS, tag)
+
+
+def _vml(tag):
+    return '{%s}%s' % (VML_NS, tag)
+
+
+def _qname(tag):
+    """把 'w:xxx' / 'v:xxx' / 'oMathxxx' 形式的标签名转成 Clark 记法。"""
+    if tag.startswith('oMath'):
+        return _m(tag)
+    if tag.startswith('v:'):
+        return _vml(tag[2:])
+    return qn(tag)
 
 
 def _has(el, *tags):
@@ -633,8 +670,12 @@ def _has(el, *tags):
 # 正文里本技能**没有完整验证过**的内容。检测到必须说出来——
 # 静默漏掉等于交付一份缺内容的文档，使用者还以为排好了。
 UNSUPPORTED = [
-    ('图片', ('w:drawing', 'w:pict'),
+    # 只认真正引用了位图的元素。红头红线、版记线是 v:line / v:shape，
+    # 没有位图文件，混进来会把「一条分隔线」报成「一张图片」。
+    ('图片', ('a:blip', 'v:imagedata'),
      '正文图片不参与重排，尺寸与位置可能变化，需生成后核对'),
+    ('图形', ('v:line', 'v:shape', 'v:rect', 'v:oval', 'v:roundrect'),
+     '线条、形状等矢量图形不保留（红头分隔线、版记线多属此类）'),
     ('文本框', ('w:txbxContent',),
      '文本框内的文字会当普通段落排，框体本身不保留'),
     ('脚注', ('w:footnoteReference',),
@@ -662,7 +703,7 @@ def scan_unsupported(elements, skip):
         if i in skip:
             continue
         for name, tags, hint in UNSUPPORTED:
-            probe = [_m(t) if t.startswith('oMath') else qn(t) for t in tags]
+            probe = [_qname(t) for t in tags]
             if _has(el, *probe):
                 rec = found.setdefault(
                     name, {'count': 0, 'index': [], 'hint': hint})
@@ -675,15 +716,22 @@ def scan_unsupported(elements, skip):
 def detect_letterhead(paras, elements):
     """识别红头（发文机关标志）、发文字号、红色分隔线。
 
-    只扫描文档**开头连续**的那几段：正文里引述「X教发〔2026〕15号」不该被当成版头删掉。
+    只扫描文档开头那几段：正文里引述「X教发〔2026〕15号」不该被当成版头删掉。
     打分判定，遇到第一个不像版头的段落即停止，保证取到的是开头整块而非散落段落。
     识别到发文字号之后，只再接受分隔线——否则正文标题可能被误纳入。
+
+    红头与发文字号之间常有空行（实测样本：红头在第 1 段、文号在第 4 段，
+    中间隔两个空行）。早期版本遇到空行就停，结果文号检不出来，反而因为
+    「首个非空非版头段落」的规则被当成了标题——红头文件最不能错的一处。
+    现在允许跨过有限个空行继续找文号，拿到文号后才收紧。
 
     返回 (索引列表, 明细列表)。
     """
     picked, detail = [], []
     got_number = False
-    for i in range(min(len(paras), 6)):
+    blank_run = 0               # 已识别版头后连续遇到的空行数
+    MAX_BLANK_RUN = 3           # 空行太多就说明版头到此为止了
+    for i in range(min(len(paras), 10)):
         text = paras[i]['text'].strip()
         # 文本框里的字不在段落的直接 w:r 下，p.text 读不到，单独取出来参与判定
         box = _textbox_text(elements[i]) if not text else ''
@@ -691,13 +739,23 @@ def detect_letterhead(paras, elements):
         if not probe:
             if _para_has_border(elements[i]) or _para_has_image(elements[i]):
                 picked.append(i)
-                detail.append({'index': i, 'text': '(分隔线)' if not _para_has_image(elements[i]) else '(红头图片)',
-                               'reason': ('无文字且带段落边框' if not _para_has_image(elements[i])
-                                          else '无文字且含图片（红头常为图片）')})
+                has_img = _para_has_image(elements[i])
+                detail.append({'index': i,
+                               'text': '(红头图片)' if has_img else '(分隔线)',
+                               'reason': ('无文字且含图形（红头常为图片或分隔线）'
+                                          if has_img else '无文字且带段落边框')})
+                blank_run = 0
                 continue
             if not picked:
                 continue          # 版头之前的空行，跳过
-            break
+            # 已拿到红头：文号还没着落时跨过空行继续找，找到了就只等分隔线
+            if not got_number:
+                blank_run += 1
+                if blank_run > MAX_BLANK_RUN:
+                    break
+                continue
+            continue              # 文号之后的空行，属于分隔线区，继续但不计数
+        blank_run = 0
         if got_number:
             break                 # 文号之后只剩分隔线，有文字就该是标题了
 
