@@ -23,6 +23,7 @@ import sys
 
 from docx import Document
 from docx.oxml.ns import qn
+from lxml import etree
 
 # 编号前缀 -> 可能的层级
 NUM_PREFIX = [
@@ -785,6 +786,72 @@ def detect_letterhead(paras, elements):
     return picked, detail
 
 
+def detect_version_record(elements, body):
+    """识别文末版记（印发机关 + 印发日期），整块原样带走、不重排。
+
+    GB/T 9704-2012 7.4：版记排在公文最后一面版心最下方，印发机关左空一字、
+    印发日期右空一字，上下各一条与版心等宽的分隔线。
+
+    做法是**不重排**：把源文档那两段（分隔线段 + 印发行）的 XML 整块搬过去。
+    版记的字号、机关与日期之间的间距、两条线都是单位自己排好的，重排一次
+    就变一次样——这正是"不要给变动"的意思。位置由生成器保证：排在文末，
+    并做沉底校准（生成器里做，见 generate_gongwen.sink_version_record）。
+
+    只在 body 末尾找：正文中间引述「……印发」的文件名不该被当成版记搬走。
+
+    返回 (版记 dict 或 None, 余下的 body)。
+    """
+    pos = None
+    for i in range(len(body) - 1, -1, -1):
+        b = body[i]
+        if not isinstance(b, dict) or b.get('type') in ('signature', 'date',
+                                                       'table'):
+            continue
+        t = (b.get('text') or '').strip()
+        if not t:
+            continue
+        if len(t) <= 60 and t.endswith('印发'):
+            pos = i
+        break
+    if pos is None:
+        return None, body
+
+    src_idx = ((body[pos].get('_src') or {}).get('index'))
+    if src_idx is None or src_idx >= len(elements):
+        return None, body
+
+    idxs = [src_idx]
+    # 上分隔线：紧邻其前的空段，且带 VML 线条 / 形状
+    j = src_idx - 1
+    if j >= 0:
+        el = elements[j]
+        txt = ''.join(t.text or '' for t in el.iter(qn('w:t'))).strip()
+        if not txt and any(_has(el, _vml(k))
+                           for k in ('line', 'shape', 'rect')):
+            idxs.insert(0, j)
+
+    blocks = []
+    for i in idxs:
+        el = elements[i]
+        # 带图片引用的段落搬 XML 会丢 rId，退回当正文处理并让验收去报
+        if el.find('.//' + qn('a:blip')) is not None \
+                or el.find('.//' + _vml('imagedata')) is not None:
+            return None, body
+        blocks.append(etree.tostring(el, encoding='unicode'))
+
+    # body 里连带它前面的空段一起移除：版记自带上方分隔线段，再留一个空行
+    # 就把分隔线顶离正文了
+    rest = body[:pos]
+    k = len(rest) - 1
+    while k >= 0 and isinstance(rest[k], dict) \
+            and not (rest[k].get('text') or '').strip():
+        k -= 1
+    rest = rest[:k + 1]
+    rest += body[pos + 1:]
+    return ({'text': body[pos]['text'], 'blocks': blocks,
+             'source_index': src_idx}, rest)
+
+
 def build(path, strip_sign=True, fidelity=FIDELITY_DEFAULT):
     """提取内容与角色建议（不修改原文）。
 
@@ -982,6 +1049,18 @@ def build(path, strip_sign=True, fidelity=FIDELITY_DEFAULT):
     if k:
         body = body[k:]
 
+    # 版记（印发机关 + 印发日期）：整块原样搬到文末，不参与重排
+    version_record, body = detect_version_record(elements, body)
+    if version_record:
+        # 版记里的线条是原样搬走的，不该再报"图形不保留"
+        vset = {version_record['source_index']}
+        if len(version_record.get('blocks') or []) > 1:
+            vset.add(version_record['source_index'] - 1)
+        for u in unsupported:
+            u['index'] = [i for i in u['index'] if i not in vset]
+            u['count'] = len(u['index'])
+        unsupported = [u for u in unsupported if u['count']]
+
     if title_idx is None:
         title = ''
     else:
@@ -1022,6 +1101,8 @@ def build(path, strip_sign=True, fidelity=FIDELITY_DEFAULT):
     if title_pag.get('keep_next'):
         # 只在确实设了的时候写，没设就不写——保持 JSON 干净
         result['title_keep_next'] = True
+    if version_record:
+        result['version_record'] = version_record
     if sig_idx is not None:
         result['signature'] = (paras[sig_idx]['raw_text'] if strict
                                else paras[sig_idx]['text']).strip()
@@ -1165,6 +1246,11 @@ def main():
                 print(f"   「{c['value']}」在第{c['first']['index']}段"
                       f"（{c['first']['source']}）与第{c['again']['index']}段"
                       f"（{c['again']['source']}）重复：{c['text']}")
+        vr = result.get('version_record')
+        if vr:
+            print(f"版记：检测到印发机关与印发日期 → 整块原样搬到文末，不参与重排"
+                  f"（含 {len(vr.get('blocks') or [])} 段，含分隔线）")
+            print(f'   {vr["text"][:60]}')
         for w in result.get('_warnings') or []:
             print(f'提示：{w}')
         tabs = result.get('tables') or []

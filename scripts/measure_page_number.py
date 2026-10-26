@@ -62,11 +62,20 @@ def to_pdf(docx_path, outdir):
             '未找到 LibreOffice（soffice），无法渲染测量。\n'
             '  macOS: brew install --cask libreoffice\n'
             '  或指定路径后重试。量不出来就是没验，不能用估算代替。')
-    # 独立 profile：默认配置被并发/强制退出破坏后会报 DeploymentException
-    subprocess.run(
-        [soffice, '-env:UserInstallation=file:///tmp/lo_profile_measure',
-         '--headless', '--convert-to', 'pdf', '--outdir', outdir, docx_path],
-        check=True, capture_output=True)
+    # 每次转换用**全新的**独立 profile。
+    # 早先固定用 /tmp/lo_profile_measure 复用同一个 profile 时，同一个 docx
+    # 连转 5 次，末页内容会来回跳（实测版记落点 109.3 / 108.3 / 78.6mm 三种
+    # 结果，正文首行位置 69.3 与 39.7mm 之间翻），分页结果不确定，任何"量完
+    # 再改"的校准都会被这个抖动带偏。改成一次一个临时 profile 后，连转四次
+    # 结果完全一致（109.3mm ×4），代价是每次多约 1 秒。
+    profile = tempfile.mkdtemp(prefix='lo_profile_')
+    try:
+        subprocess.run(
+            [soffice, f'-env:UserInstallation=file://{profile}',
+             '--headless', '--convert-to', 'pdf', '--outdir', outdir, docx_path],
+            check=True, capture_output=True)
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
     pdf = os.path.join(outdir,
                        os.path.splitext(os.path.basename(docx_path))[0] + '.pdf')
     if not os.path.exists(pdf):

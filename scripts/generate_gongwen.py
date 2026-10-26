@@ -15,7 +15,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -25,6 +27,13 @@ from docx.oxml.ns import qn
 from docx.shared import Mm, Pt
 from docx.text.paragraph import Paragraph
 from lxml import etree
+
+# 版记沉底要转 PDF 测量，渲染能力复用页码实测脚本（同为可选依赖）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from measure_page_number import find_soffice, to_pdf
+except Exception:                      # noqa: BLE001 - 缺依赖就退回不校准
+    find_soffice = to_pdf = None
 
 # ── 排版常量（依据 GB/T 9704-2012） ──────────────────────
 
@@ -379,6 +388,43 @@ def set_left_indent_chars(paragraph, chars=1):
     set_indent_pt(paragraph, left=chars * SIZE_BODY)
 
 
+def _is_wide_char(ch):
+    """全角字符判定（汉字、全角标点、假名、谚文等）。"""
+    o = ord(ch)
+    return (0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0xA4CF
+            or 0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF
+            or 0xFE30 <= o <= 0xFE6F or 0xFF00 <= o <= 0xFF60
+            or 0xFFE0 <= o <= 0xFFE6)
+
+
+def text_width_pt(text, size=SIZE_BODY):
+    """估算一段文字的排版宽度（磅）：全角按字号、半角按半字号。
+
+    只用来算落款与成文日期的相对位置。差半个字宽不影响观感，
+    真要精确到毫米得渲染测量（scripts/measure_page_number.py 的做法）。
+    """
+    return sum(size if _is_wide_char(c) else size * 0.5 for c in (text or ''))
+
+
+def sign_date_indents(signature, date, size=SIZE_BODY, right_chars=2):
+    """落款：署名与成文日期共用一条中心线，日期以单位名称为中。
+
+    GB/T 9704-2012 7.3.5 的字面是「署名右空二字、成文日期右空四字」，
+    那是两组各自的右对齐——日期比署名长时会明显左探出去，盖印章时
+    印章盖不住两者中间。实际操作里普遍要求**成文日期相对署名居中**。
+
+    做法：取两者较宽者为基准右空二字，另一者按宽度差减半缩进，
+    于是两条文字的中心落在同一条竖线上。
+
+    返回 (署名右缩进磅值, 日期右缩进磅值)，都以版心右边缘为起点。
+    """
+    sw = text_width_pt(signature, size) if signature else 0.0
+    dw = text_width_pt(date, size) if date else 0.0
+    block = max(sw, dw, 0.0)
+    center = right_chars * size + block / 2.0
+    return (center - sw / 2.0, center - dw / 2.0)
+
+
 def add_paragraph(doc, text, font_name=None, font_size=SIZE_BODY,
                   bold=False, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
                   indent=True, line_spacing=LINE_BODY,
@@ -408,22 +454,26 @@ def add_blank(doc, line_spacing=LINE_BODY):
 _NUM_PREFIX_CHARS = 1.5
 
 
-def _add_signature_para(doc, text):
-    """发文机关署名：右对齐、右空二字（7.3.5）。"""
+def _add_signature_para(doc, text, right_pt=None):
+    """发文机关署名：右对齐，缩进由 sign_date_indents 给出（默认右空二字）。"""
     para = doc.add_paragraph()
     para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     set_line_spacing(para, LINE_BODY)
-    set_right_indent_chars(para, 2)
+    set_indent_pt(para, right=(2 * SIZE_BODY if right_pt is None else right_pt))
     set_font(para.add_run(text), FONT_BODY, SIZE_BODY)
     return para
 
 
-def _add_date_para(doc, text):
-    """成文日期：右对齐、右空四字（7.3.5）。"""
+def _add_date_para(doc, text, right_pt=None):
+    """成文日期：右对齐，缩进由 sign_date_indents 给出（默认右空四字）。
+
+    与署名共用中心线时 right_pt 会比署名小——日期宽、署名窄，日期右探
+    出去才是「居中于单位名称」的正确结果。
+    """
     para = doc.add_paragraph()
     para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     set_line_spacing(para, LINE_BODY)
-    set_right_indent_chars(para, 4)
+    set_indent_pt(para, right=(4 * SIZE_BODY if right_pt is None else right_pt))
     set_font(para.add_run(text), FONT_BODY, SIZE_BODY)
     return para
 
@@ -1047,6 +1097,426 @@ def _get_even_footer(section):
         return None
 
 
+# ── 版记（印发机关 + 印发日期，GB/T 9704-2012 7.4）──────
+
+TYPE_BOTTOM_MM = 262.0        # 版心下边缘 = 297 - 35
+VERSION_BLOCK_MM = 40.0       # 版记块（上线条 + 印发行 + 下线条）占的高度
+# 版记底线的落点。国标 7.4.2/7.4.3 要版记排在版心最下方、末条分隔线为版记
+# 的最后一行，理论上应当贴着版心下边缘（262mm）。这里收在 252mm——留一格
+# （正文一行 28 磅 ≈ 9.9mm）余量。原因：成品在本机是用替代字体渲染的，用户
+# 在装有国标字体的 Word 里打开时行数可能差一行；贴死到 262 一旦多出一行，
+# 版记就会被整体挤到新的一页，出现"末页只有版记"的硬伤。留一格只表现为
+# 底部多一点白，不会翻页。
+VERSION_BOTTOM_LINE_MM = TYPE_BOTTOM_MM - 10.0
+# 印发机关那一行文字的 bbox 底边，比下分隔线低约 0.78mm（实测：
+# 文字 y1=109.33，下分隔线 y=108.55）。用来在下分隔线量不到时兜底换算。
+VERSION_TEXT_TO_LINE_MM = 0.8
+
+
+def _spacer_p(before_pt=0.0):
+    """一个只有 1 磅行高、可带段前间距的空段落——把版记往下推一格。
+
+    为什么不像早先那样堆一串 28 磅空段落：空段在分页边界上会被渲染器静默
+    丢掉几段（实测设 12 段只推进到 183mm、设 14 段落在 217mm），垫多少都不
+    确定；而且空段高度还受文档网格影响，不是 28 磅。
+
+    改成一个空段 + 一个 `w:before` 数值后，位移与这个数值是严格 1:1 的
+    （实测 before=200 磅 → 版记下移 70.56mm = 200 磅），写多少就是多少。
+    """
+    p = OxmlElement('w:p')
+    pPr = OxmlElement('w:pPr')
+    snap = OxmlElement('w:snapToGrid')
+    snap.set(qn('w:val'), 'false')
+    pPr.append(snap)
+    sp = OxmlElement('w:spacing')
+    sp.set(qn('w:before'), str(int(round(before_pt * 20))))
+    sp.set(qn('w:after'), '0')
+    sp.set(qn('w:line'), '20')           # 1 磅固行距
+    sp.set(qn('w:lineRule'), 'exact')
+    pPr.append(sp)
+    rPr = OxmlElement('w:rPr')           # 1 磅字，别让行高被字号撑起来
+    sz = OxmlElement('w:sz')
+    sz.set(qn('w:val'), '2')
+    rPr.append(sz)
+    pPr.append(rPr)
+    p.append(pPr)
+    return p
+
+
+def add_version_record(doc, vr):
+    """把版记整块原样搬到文末，返回 (首元素, 末元素)。
+
+    blocks 是源文档那几段的原始 XML（上分隔线段 + 印发行，下分隔线在印发行
+    自身里）。整块搬而不是重排：版记是单位自己排好的，字号、印发机关与印发
+    日期之间的间距、两条分隔线都属"不要给变动"的部分——重排一次就变一次样。
+    """
+    body = doc.element.body
+    sectPr = body.find(qn('w:sectPr'))
+    made = []
+    for xml in (vr.get('blocks') or []):
+        el = etree.fromstring(xml.encode('utf-8'))
+        if sectPr is not None:
+            sectPr.addprevious(el)
+        else:
+            body.append(el)
+        made.append(el)
+    # 版记是"上线条 + 印发行 + 下线条"一个整体，不能被拆到两页去：
+    # 不设「与下段同页」时，遇到分页边界会出现上半截在前一页、
+    # 印发机关掉到下一页的情况（实测垫到某几段数时位置会突然跳上来）。
+    for el in made[:-1]:
+        pPr = el.find(qn('w:pPr'))
+        if pPr is None:
+            pPr = OxmlElement('w:pPr')
+            el.insert(0, pPr)
+        if pPr.find(qn('w:keepNext')) is None:
+            keep = OxmlElement('w:keepNext')
+            # 顺序：keepNext 必须排在 spacing / ind / jc 之前
+            anchor = None
+            for tag in ('w:spacing', 'w:ind', 'w:jc', 'w:rPr'):
+                anchor = pPr.find(qn(tag))
+                if anchor is not None:
+                    break
+            if anchor is not None:
+                anchor.addprevious(keep)
+            else:
+                pPr.append(keep)
+
+    # 版记不吸附文档网格。国标正文是 28 磅网格，而版记是四号字、1.4 倍行距，
+    # 吸到 28 磅网格上行会变高，那两条按源文档相对位置画的 VML 分隔线就会
+    # 穿到字上（实测印发机关行底部压在下横线上）。关掉吸附，行高回到源样，
+    # 线条位置也就回到了源样——这同样是"不要给变动"的一部分。
+    for el in made:
+        pPr = el.find(qn('w:pPr'))
+        if pPr is None:
+            pPr = OxmlElement('w:pPr')
+            el.insert(0, pPr)
+        if pPr.find(qn('w:snapToGrid')) is None:
+            snap = OxmlElement('w:snapToGrid')
+            snap.set(qn('w:val'), 'false')
+            # schema 顺序：snapToGrid 在 spacing / ind / jc 之前
+            anchor = None
+            for tag in ('w:spacing', 'w:ind', 'w:jc', 'w:rPr'):
+                anchor = pPr.find(qn(tag))
+                if anchor is not None:
+                    break
+            if anchor is not None:
+                anchor.addprevious(snap)
+            else:
+                pPr.append(snap)
+    return (made[0] if made else None), (made[-1] if made else None)
+
+
+def _vrecord_head_el(doc, marker):
+    """版记块的首元素：印发行，或它前面那条带 VML 线条的上分隔线段。
+
+    沉底垫的空段落全部插在这个元素之前，删的时候也只会删到它为止——
+    不会误删正文。
+    """
+    p = None
+    for para in doc.paragraphs:
+        if marker and marker in (para.text or ''):
+            p = para
+            break
+    if p is None:
+        return None
+    el = p._element
+    prev = el.getprevious()
+    if prev is not None and prev.tag == qn('w:p'):
+        txt = ''.join(t.text or '' for t in prev.iter(qn('w:t'))).strip()
+        has_shape = any(True for _ in prev.iter('{%s}shape' % VML_NS)) \
+            or any(True for _ in prev.iter('{%s}line' % VML_NS))
+        if not txt and has_shape:
+            return prev
+    return el
+
+
+def _vrecord_probes(marker):
+    """版记行的匹配串，从长到短。
+
+    长串用来避免误命中正文（正文里也可能出现「XX师范大学」）；
+    短串用来兜底两种情况：PDF 里这一行可能被拆成两块（印发机关一块、
+    印发日期一块），以及版记被推到新一页时 PyMuPDF 抽文字会掉字
+    （实测「XX师范大学党政办公室」抽成「宁师范大学党政办公室辽」，
+    前 4 个字全废，只有中段的「党政办公室」仍然完整）。
+    """
+    m = re.sub(r'\s', '', marker or '')
+    out = []
+    for cand in (m[:10], m[:8], m[:6], '党政办公室', '印发日期', '印发'):
+        if len(cand) >= 3 and cand not in out and cand in (m or cand):
+            out.append(cand)
+    return out
+
+
+def _measure_vrecord(docx_path, marker):
+    """量版记位置，返回 (页数, 印发行文字底边 mm, 下分隔线 mm)。
+
+    分隔线按形状找而不是按文字找：版记上下两条线与版心等宽（156mm，x 从
+    28 到 184mm），末页里没有别的横线会这么长，所以「版心宽的横线」就是
+    版记的分隔线，取最下面那条即下分隔线；再与文字底边互相校验，防止把
+    表格线一类的东西误当分隔线。
+    量不出来返回 None（量不出来就是没验，不拿估计值冒充）。
+    """
+    if to_pdf is None:
+        return None, None, None
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        return None, None, None
+    probes = _vrecord_probes(marker)
+    tmp = tempfile.mkdtemp(prefix='vr_measure_')
+    try:
+        pdf = to_pdf(docx_path, tmp)
+        doc = fitz.open(pdf)
+        pages = len(doc)
+        page = doc[-1]
+        px = 72 / 25.4
+        text_y1 = None
+        for b in page.get_text('blocks'):
+            y1_mm = b[3] / px
+            # 只看版心以内：页码在 268mm 附近，混进来会把版记量成页脚
+            if y1_mm > TYPE_BOTTOM_MM + 0.5:
+                continue
+            txt = re.sub(r'\s', '', b[4] or '')
+            if any(pt in txt for pt in probes):
+                text_y1 = y1_mm if text_y1 is None else max(text_y1, y1_mm)
+        # 版记底线：版心宽的横线，且与印发行紧邻（上线条在文字上方约 15mm）
+        cands = []
+        min_w = 140 * px
+        for drawing in page.get_drawings():
+            for item in drawing.get('items') or []:
+                y = None
+                if item[0] == 'l':
+                    p1, p2 = item[1], item[2]
+                    if abs(p1.y - p2.y) < 0.5 and abs(p2.x - p1.x) >= min_w:
+                        y = p1.y / px
+                elif item[0] == 're':
+                    r = item[1]
+                    if r.height < 1.5 and r.width >= min_w:
+                        y = r.y1 / px
+                if y is None:
+                    continue
+                if text_y1 is not None and not (text_y1 - 30 <= y <= text_y1 + 8):
+                    continue
+                cands.append(y)
+        line_y = round(max(cands), 2) if cands else None
+        doc.close()
+        return pages, (round(text_y1, 2) if text_y1 is not None else None), line_y
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _vrecord_pos(line_y, text_y1):
+    """版记当前底线位置：优先用下分隔线，量不到用文字底边换算。"""
+    if line_y is not None:
+        return line_y
+    if text_y1 is None:
+        return None
+    return text_y1 - VERSION_TEXT_TO_LINE_MM
+
+
+def _measure_vrecord_robust(docx_path, marker, n=5):
+    """多测几次取**最大值**，返回 (页数, 底线位置 mm)。
+
+    为什么要多测：同一个 docx 连转 8 次，约 1/5 的次数末页内容会整体上移
+    3 行（下分隔线 255.3mm → 225.7mm），是 LibreOffice 在分页边界上的偶发
+    重排，改 profile、去 keepNext 都没能消除。取最大值就是取"版心排得最满"
+    的那个布局——它占了约 4/5 的次数，是渲染器的常态结果；偶发的上移变体
+    只会在成品里表现为多留一行空白，不会把版记顶到页外。
+
+    页数也取最大值：宁可认为页数更多，也不要把溢出看成没溢出。
+    """
+    pages = None
+    vals = []
+    for _ in range(max(1, n)):
+        p, y1, ln = _measure_vrecord(docx_path, marker)
+        if p is not None:
+            pages = p if pages is None else max(pages, p)
+        v = _vrecord_pos(ln, y1)
+        if v is not None:
+            vals.append(v)
+    if not vals:
+        return pages, None
+    return pages, max(vals)
+
+
+def sink_version_record(docx_path, marker):
+    """把版记沉到末页版心最下方，返回 (是否成功, 说明)。
+
+    国标 7.4.2：版记排在最后一面版心最下方（版记最后一个要素在最后一行）。
+    Word 没有"贴底"属性，只能靠留白把版记推下去。这里在版记前插**一个**
+    1 磅高的空段落，并给它一个 `w:before` 段前间距——一个 twips 数值表示
+    全部留白（见 _spacer_p 的说明）。
+
+    四次踩坑决定了现在的写法：
+    1. "还差多少就再补多少"式迭代会失控——版记被挤到新一页后，新页顶部的大片
+       空白又变成"还差很多"，越垫越多（实测把 6 页垫成 8 页）。
+    2. 空段推进量不可信——渲染器在分页边界上会静默丢空段（设 12 段只到 183mm、
+       设 14 段落在 217mm），按段数精算不成立。改成一个空段 + 一个段前间距后，
+       位移与数值严格 1:1（实测 before=200 磅 → 下移 70.56mm）。
+    3. 早先复用同一个 LibreOffice profile，同一个 docx 连转 5 次末页落点会在
+       109.3 / 108.3 / 78.6mm 之间跳；改成每次全新 profile 后不再抖。
+    4. 即使 profile 独立，仍有约 1/5 的概率末页整体上移 3 行（去 keepNext、
+       换字体都试过，消不掉），所以测量取多次里的最大值，见
+       _measure_vrecord_robust。
+
+    也试过给版记加 `w:framePr`（yAlign=bottom 锚定版心底部，本可完全不依赖
+    正文流），但 LibreOffice 直接忽略 y 定位属性，没法在本机验证渲染结果，
+    故不采用——验证不了的排版不写进成品。
+    """
+    if find_soffice is None or find_soffice() is None:
+        return None, '未找到 LibreOffice，未做沉底校准（版记已排在文末）'
+    try:
+        import pymupdf  # noqa: F401
+    except ImportError:
+        return None, '未安装 PyMuPDF，未做沉底校准（版记已排在文末）'
+    target = VERSION_BOTTOM_LINE_MM
+    pt_per_mm = 72 / 25.4
+
+    tmpdir = tempfile.mkdtemp(prefix='vr_base_')
+    base = os.path.join(tmpdir, 'base.docx')
+    shutil.copy(docx_path, base)
+
+    def apply(before_pt):
+        """从基线重建，插一个带段前间距的空段。"""
+        shutil.copy(base, docx_path)
+        doc = Document(docx_path)
+        head = _vrecord_head_el(doc, marker)
+        if head is None:
+            return False
+        head.addprevious(_spacer_p(before_pt))
+        doc.save(docx_path)
+        return True
+
+    try:
+        pages0, cur0 = _measure_vrecord_robust(docx_path, marker, 5)
+        if cur0 is None:
+            return None, '成品里定位不到版记行，未做沉底校准'
+        if target - cur0 <= 0.8:
+            return True, (f'版记已在最下方，未加段前间距'
+                          f'（下分隔线 {cur0:.1f}mm，{pages0} 页）')
+
+        before = (target - cur0) * pt_per_mm
+        if not apply(before):
+            return None, '成品里定位不到版记行，未做沉底校准'
+        pages_c, cur = _measure_vrecord_robust(docx_path, marker, 3)
+        if cur is None:
+            shutil.copy(base, docx_path)
+            return None, '沉底后定位不到版记行，已按未沉底保留'
+
+        # 溢出：版记被推过页尾落到新一页（间距在新页页顶会被丢掉，位置反而
+        # 更靠上）。此时在 0 与当前值之间二分，取"不溢出里最靠下"的那个。
+        lo, hi = 0.0, None
+        for _ in range(3):
+            if pages_c is None or pages_c <= pages0:
+                break
+            hi = before
+            before = (lo + hi) / 2
+            apply(before)
+            pages_c, cur = _measure_vrecord_robust(docx_path, marker, 1)
+        if pages_c is not None and pages_c > pages0:
+            shutil.copy(base, docx_path)
+            return False, (f'版记加段前间距会掉到新的一页（{pages_c} 页），'
+                           f'已按原位置保留，请目视核对')
+
+        # 毫米级修正一次即可（1:1 位移，实测残差 0.3mm 内）
+        if abs(target - cur) > 1.5:
+            prev = before
+            before = max(0.0, before + (target - cur) * pt_per_mm)
+            apply(before)
+            pages_v, cur_v = _measure_vrecord_robust(docx_path, marker, 3)
+            if cur_v is None or (pages_v is not None and pages_v > pages0):
+                # 修正后反而溢出，退回上一版
+                before = prev
+                apply(before)
+            else:
+                cur = cur_v
+
+        tw = int(round(before * 20))
+        return True, (f'版记贴底：下分隔线 {cur:.1f}mm'
+                      f'（版心下边缘 {TYPE_BOTTOM_MM:.0f}mm，'
+                      f'距底 {TYPE_BOTTOM_MM - cur:.1f}mm），'
+                      f'段前间距 {tw / 20:.1f} 磅，{pages0} 页')
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _measure_block_centers(docx_path, signature, date):
+    """量落款署名与成文日期两条文字的中心线（毫米），量不出来返回 (None, None)。"""
+    if to_pdf is None:
+        return None, None
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        return None, None
+    want_s = re.sub(r'\s', '', signature or '')
+    want_d = re.sub(r'\s', '', date or '')
+    tmp = tempfile.mkdtemp(prefix='vr_sign_')
+    try:
+        pdf = to_pdf(docx_path, tmp)
+        doc = fitz.open(pdf)
+        px = 72 / 25.4
+        got_s = got_d = None
+        for page in doc:
+            for b in page.get_text('blocks'):
+                txt = re.sub(r'\s', '', b[4] or '')
+                c = (b[0] + b[2]) / 2 / px
+                # 只认整块就是这一条的文字：正文里「XX师范大学家具管理办法」
+                # 这种包含关系不能算
+                if want_s and txt == want_s and got_s is None:
+                    got_s = c
+                elif want_d and txt == want_d and got_d is None:
+                    got_d = c
+            if got_s is not None and got_d is not None:
+                break
+        doc.close()
+        return got_s, got_d
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def align_date_to_signature(docx_path, signature, date, tol_mm=0.8, rounds=2):
+    """让成文日期的中心线落在发文机关署名的中心上。
+
+    sign_date_indents 是按估算字宽算缩进的，但中文与数字混排时渲染器会
+    额外加间距（实测日期实际比估算宽 12 磅），中心会差 2mm 左右。
+    所以最后一步改成量出来再挪：量两条文字的中心，差多少就把日期段落的
+    右缩进改多少，最多两轮。
+    """
+    if not signature or not date:
+        return None, '只有一侧有落款，无需居中'
+    last = None
+    for _ in range(rounds):
+        cs, cd = _measure_block_centers(docx_path, signature, date)
+        if cs is None or cd is None:
+            return None, '渲染里定位不到落款，未做日期居中校准'
+        diff = cs - cd                     # 正数=日期偏左，要往右挪
+        last = diff
+        if abs(diff) <= tol_mm:
+            return True, f'日期中心与单位名称中心偏差 {abs(diff):.2f}mm'
+        doc = Document(docx_path)
+        tgt = re.sub(r'\s', '', date)
+        hit = None
+        for p in doc.paragraphs:
+            if re.sub(r'\s', '', p.text or '') == tgt:
+                hit = p
+                break
+        if hit is None:
+            return None, '成品里定位不到成文日期段落'
+        pPr = hit._element.find(qn('w:pPr'))
+        ind = pPr.find(qn('w:ind')) if pPr is not None else None
+        if ind is None:
+            return None, '成文日期段落没有缩进设置，未做校准'
+        cur = int(ind.get(qn('w:right')) or 0)
+        # 中心右移 diff 毫米 = 右缩进减少同样距离（1mm = 56.7 twips）
+        new = max(0, cur - int(diff * 72 / 25.4 * 20))
+        ind.set(qn('w:right'), str(new))
+        doc.save(docx_path)
+    cs, cd = _measure_block_centers(docx_path, signature, date)
+    if cs is None or cd is None:
+        return None, '校准后定位不到落款'
+    return abs(cs - cd) <= tol_mm, f'日期与署名中心偏差 {abs(cs - cd):.2f}mm'
+
+
 # ── 主体构建 ─────────────────────────────────────────────
 
 
@@ -1331,6 +1801,20 @@ def build_document(content, output_path, on_exist=None):
     sign_in_body = False                 # 落款是否已在 body 原位出现
     blank_run = 0                        # 连续空段计数
 
+    # 署名与成文日期要共用一条中心线，得先知道两者的文字（不管落在 body
+    # 里还是顶层字段），才能在渲染前把两个缩进一次算出来。
+    _sig_text = _date_text = None
+    for _it in content.get('body', []):
+        if isinstance(_it, dict):
+            _r = ROLE_ALIASES.get(_it.get('type'), _it.get('type'))
+            if _r == 'signature':
+                _sig_text = _it.get('text') or ''
+            elif _r == 'date':
+                _date_text = _it.get('text') or ''
+    _sig_text = _sig_text or content.get('signature') or ''
+    _date_text = _date_text or content.get('date') or ''
+    _sig_right, _date_right = sign_date_indents(_sig_text, _date_text)
+
     for item in content.get('body', []):
         # 表格占位：{"type": "table", "index": 0}
         if isinstance(item, dict) and item.get('type') == 'table':
@@ -1359,12 +1843,12 @@ def build_document(content, output_path, on_exist=None):
         if role == 'signature':
             sign_in_body = True
             blank_run = 0
-            _add_signature_para(doc, text)
+            _add_signature_para(doc, text, _sig_right)
             continue
         if role == 'date':
             sign_in_body = True
             blank_run = 0
-            _add_date_para(doc, text)
+            _add_date_para(doc, text, _date_right)
             continue
 
         if role == 'blank' or not text.strip():
@@ -1428,9 +1912,9 @@ def build_document(content, output_path, on_exist=None):
     if (signature or date) and not sign_in_body:
         add_blank(doc)
         if signature:
-            _add_signature_para(doc, signature)
+            _add_signature_para(doc, signature, _sig_right)
         if date:
-            _add_date_para(doc, date)
+            _add_date_para(doc, date, _date_right)
 
     # 未在 body 中显式定位的表格，追加到文末（落款之后）
     for idx, t in enumerate(tables):
@@ -1440,6 +1924,14 @@ def build_document(content, output_path, on_exist=None):
                       header=t.get('header', True),
                       align=t.get('align', 'center'),
                       spans=t.get('spans'), ncol=t.get('ncol'))
+
+    # 版记（印发机关 + 印发日期）：整块原样搬到文末，排在末页最下方。
+    # 前面不留空行——版记自带上方分隔线，再垫一个空行就把线顶离正文了；
+    # 沉底靠 sink_version_record 在 save 之后实测插入段前间距来完成。
+    vr = content.get('version_record') or {}
+    vr_marker = (vr.get('text') or '').strip()
+    if vr_marker and vr.get('blocks'):
+        add_version_record(doc, vr)
 
     # 页码
     mode = resolve_page_number_mode(content.get('page_number'))
@@ -1481,6 +1973,16 @@ def build_document(content, output_path, on_exist=None):
         for role, (old, new) in changed.items():
             print(f'  {old} → {new}')
         print('  （在装有国标字体的机器上生成则不会发生替换）')
+
+    # 落款日期居中 + 版记沉底，都要渲染测量，只能在 save 之后做
+    if _sig_text and _date_text and not content.get('_no_measure'):
+        ok, msg = align_date_to_signature(out, _sig_text, _date_text)
+        if msg:
+            print(f'日期居中：{msg}')
+    if vr_marker and vr.get('blocks') and not content.get('_no_measure'):
+        ok, msg = sink_version_record(out, vr_marker)
+        if msg:
+            print(f'版记沉底：{msg}')
     return out
 
 
