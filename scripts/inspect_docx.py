@@ -537,6 +537,31 @@ def _para_is_red(el):
     return any(is_red_color(c.get(qn('w:val'))) for c in el.iter(qn('w:color')))
 
 
+def _para_pagination(el):
+    """段落的分页控制属性（Word「换行和分页」里的两个开关）。
+
+    w:keepNext         = 与下段同页 —— 标题不孤零零留在页末，这是最常见的设置
+    w:keepLines        = 段中不分页 —— 一段文字不跨页断开
+    w:pageBreakBefore  = 段前分页 —— 这一段另起一页
+
+    源文档设了而成品不写，分页就会变。这不是字体字号那类"不够好看"的偏差，
+    是标题掉在页底、正文被切开的排版事故，必须跟内容一样带走。
+
+    注意：手动分页符（run 里的 w:br type="page"）不在此列，本技能不保留。
+    """
+    pPr = el.find(qn('w:pPr'))
+    if pPr is None:
+        return {}
+    out = {}
+    for tag, key in (('w:keepNext', 'keep_next'),
+                     ('w:keepLines', 'keep_lines'),
+                     ('w:pageBreakBefore', 'page_break_before')):
+        node = pPr.find(qn(tag))
+        if node is not None and (node.get(qn('w:val')) or 'true').lower() != 'false':
+            out[key] = True
+    return out
+
+
 def _para_has_border(el):
     pPr = el.find(qn('w:pPr'))
     return pPr is not None and pPr.find(qn('w:pBdr')) is not None
@@ -813,6 +838,8 @@ def build(path, strip_sign=True):
 
         role, conf, reason = suggest(sig)
         item = {'type': role, 'text': text}
+        # 分页控制原样带走：源段落设了「与下段同页」，成品也要设，否则标题会掉页底
+        item.update(_para_pagination(elements[i]))
         item['_src'] = {
             'index': sig['index'],
             'style': sig['style'],
@@ -829,6 +856,9 @@ def build(path, strip_sign=True):
                               'suggested': role, 'reason': reason})
 
     title = paras[title_idx]['text'].strip() if title_idx is not None else ''
+    # 标题的「与下段同页」：公文标题几乎都设了，丢了就是标题落在页末
+    title_pag = (_para_pagination(elements[title_idx])
+                 if title_idx is not None else {})
 
     # 页码：源文档没有就不加，有则沿用原样式
     pn = detect_page_number(doc)
@@ -846,8 +876,14 @@ def build(path, strip_sign=True):
                   '标题取首个非空段落；落款署名与成文日期已从 body 剥离'
                   '（见 signature / date / _stripped），避免重复输出。'
                   '版头（红头/发文字号/分隔线）不参与重排，由 header 记录'
-                  '并原样复制到新文档——不要替用户重做红头。'),
+                  '并原样复制到新文档——不要替用户重做红头。'
+                  'keep_next / keep_lines 是源段落的分页控制'
+                  '（与下段同页 / 段中不分页），原样带走到成品；'
+                  '不需要可删除。'),
     }
+    if title_pag.get('keep_next'):
+        # 只在确实设了的时候写，没设就不写——保持 JSON 干净
+        result['title_keep_next'] = True
     if sig_idx is not None:
         result['signature'] = paras[sig_idx]['text'].strip()
     if date_idx is not None:

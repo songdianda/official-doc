@@ -15,7 +15,7 @@ examples_en:
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
   - "Reformat this request with an attached table, keeping the original page numbering"
-version: 1.12.0
+version: 1.13.0
 author: songdianda
 user-invocable: true
 ---
@@ -30,7 +30,8 @@ user-invocable: true
 
 ## 工作流程
 
-1. **获取内容**：用户提供 `.docx` 路径时，用 `scripts/inspect_docx.py` 提取全文、样式线索与角色建议；脚本会**自动检测源文档是否已有页码**，**识别并剥离版头**（红头/发文字号/分隔线，原样保留不重排），**把落款署名与成文日期剥离到 `signature` / `date`**（生成器会重新输出，留在正文里会重复），并保留表格的合并单元格结构。
+1. **获取内容**：用户提供 `.docx` 路径时，用 `scripts/inspect_docx.py` 提取全文、样式线索与角色建议；脚本会**自动检测源文档是否已有页码**，**识别并剥离版头**（红头/发文字号/分隔线，原样保留不重排），**把落款署名与成文日期剥离到 `signature` / `date`**（生成器会重新输出，留在正文里会重复），保留表格的合并单元格结构，
+并**保留段落的分页控制**（与下段同页 / 段中不分页 / 段前分页）。
    - **版头若不识别，红头会被当成标题排成二号小标宋，真正的标题反而沦为普通正文**——这一步不能跳。
    - 主送机关、附件说明**误判代价高**（删了就丢内容），脚本只列候选 `_candidates`，由你确认后填入对应字段并删除 body 中的该段。
 2. **判定段落角色**（关键）：逐段确定是标题还是编号正文，规则见 `references/paragraph-roles.md`。
@@ -50,11 +51,20 @@ user-invocable: true
    - **输入数据会在生成前集中校验**，一次报出所有字段问题（退出码 1）。表格下标越界、单元格写成数字、`page_number` 拼错都会拦下，**不会产出半份文档**。
    - 多个附件**逐条单独成段**，长名称回行与名称首字对齐（国标 7.3.4），不要拼成一段。
 6. **生成后验收**（不可跳过）：调用 `scripts/verify_output.py` 比对源文件与成品。
-   - 它只比对**内容**——段落文字、表格单元格、图片数量，用来拦住漏字、漏表、漏图。
+   - 它回答"源文档里的东西还在不在"，**不看版式**。三道检查互相独立：
+     1. **原文覆盖**：直接从源文档读每一段（含表格格、页眉页脚），逐条在成品里找。
+        基准不经过提取结果——否则"提取 JSON 和成品同时漏掉同一段"会得出一致的假结论。
+        漏在提取环节还是排版环节，报告里会分别标注。
+     2. **表格逐格**：按 (行, 列) 坐标比对。只比内容集合抓不到两格互换、抓不到重复值少一个。
+     3. **图片分部位**：正文 / 页眉页脚 / 脚注尾注批注分别计数。只数正文会把页眉图片数成 0，
+        页眉图丢了也报"双方 0 张"。
    - **它不能证明版式正确**，版式仍需逐页查看。两者是两道检查，不能互相替代。
    - 报告里会说明有意调整的部分（落款剥离、自动编号补回、版头复制），这些不是缺陷。
    - 有差异就停下核对，不要带着差异交付。
-7. **交付**：告知输出路径（**若因重名另存，必须告知实际写入的是 `_2` 而非原指定路径**）、实际使用的字体（字体回退情况）、存疑段落的处理结果、
+7. **版式实测**（可选，需要 LibreOffice 与 PyMuPDF）：`python3 scripts/measure_page_number.py 成品.docx`
+   把成品转成 PDF 渲染后扫描墨迹，量出页码一字线上沿距版心下边缘的毫米数（国标 7mm）。
+   页脚设多少不等于页码落在哪里，**只能量、不能推**；量不出来就明确报错，不用估算充数。
+8. **交付**：告知输出路径（**若因重名另存，必须告知实际写入的是 `_2` 而非原指定路径**）、实际使用的字体（字体回退情况）、存疑段落的处理结果、
    **版头是否保留**（识别到几段、保留的是什么），
    **`_number_conflicts` 的编号重复与 `_warnings` 的提示**（如"文档以表格开头"），
    **`_unsupported` 里未完整验证的内容**（正文图片、脚注、修订、公式等，本技能不保留），
@@ -74,6 +84,9 @@ python3 scripts/inspect_docx.py 原文.docx -o content.json   # 提取 + 角色�
 # （审阅 content.json 的 _uncertain，定稿 type）
 python3 scripts/generate_gongwen.py --config content.json --output 公文.docx
 python3 scripts/verify_output.py 原文.docx 公文.docx content.json   # 内容验收
+
+# 版式实测（可选，需 LibreOffice + pip install pymupdf）
+python3 scripts/measure_page_number.py 公文.docx      # 量页码位置是否 7mm
 
 # 不剥离署名与成文日期（自动剥离在特殊文档中可能判错时用）
 python3 scripts/inspect_docx.py 原文.docx -o content.json --no-strip
@@ -134,6 +147,11 @@ python3 scripts/generate_gongwen.py --check-fonts
 居中 vs 奇偶页：7.5 的左右错位是为**双面装订**设计的——翻开书时页码靠外侧才好看。单面打印或电子传阅时页码忽左忽右反而凌乱。
 
 `type` 取值：`heading1`~`heading5`、`body`、`numbered_body`、`blank`、`table`。
+
+**分页控制**：body 元素可带 `keep_next`（与下段同页）、`keep_lines`（段中不分页）、
+`page_break_before`（段前分页），取值 `true`。源段落设了就会写进 JSON，生成器照搬到成品；
+没设就不写。标题掉了页末、一段文字被切开是排版事故，不因重排而丢。
+注意：**手动分页符**（run 里的 `w:br type="page"`）不保留，需要手工补。
 
 **附表**：`scripts/inspect_docx.py` 会把源文档表格提取到 `tables`，并在 `body` 对应位置插 `{"type":"table","index":0}`。
 排版为居中 + 全线边框 + 表头 12 磅加粗 + 数据 10.5 磅。**表格数据必须与原文逐格一致，不得改动数值。**
@@ -242,6 +260,11 @@ Word 的「一、」「（一）」「1.」有时不是手打的，而是多级�
 | 脚注、尾注、批注 | 内容不在正文段落里，不会被提取 |
 | 修订标记 | 按最终显示文本提取；含未接受修订时结果可能不符预期 |
 | 嵌入对象（图表 / OLE）、公式 | 不会被提取 |
+| 页眉页脚里的文字 | 除页码外不复制（版头在正文段落里时会保留；在页眉里的不会） |
+| 手动分页符 | `w:br type="page"` 不保留，需手工补 |
+
+页眉页脚与脚注的内容缺失，`scripts/verify_output.py` 会作为提示列出（不计入失败），
+但**交付时仍要说明**——那也是原文里有的东西。
 
 **不能静默跳过**。交付时必须转达这些条目，让用户知道有什么东西没被带过去。
 

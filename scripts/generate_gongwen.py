@@ -213,6 +213,40 @@ def set_line_spacing(paragraph, pt_value):
     spacing.set(qn('w:after'), '0')
 
 
+def set_pagination(paragraph, keep_next=False, keep_lines=False,
+                   page_break_before=False):
+    """段落分页控制：与下段同页 / 段中不分页 / 段前分页。
+
+    「标题与后段同页」是 Word 里最常用的一个开关，藏在 w:pPr 里，
+    看不到也不影响字体字号，但丢掉之后标题会孤零零留在页末——
+    属于排版事故，不是美观问题。源文档设了就必须跟着走。
+
+    schema 顺序：w:keepNext / w:keepLines / w:pageBreakBefore 必须排在
+    w:numPr、w:spacing、w:ind、w:jc **之前**，直接 append 会被严格的
+    解析器判为不合规。
+    """
+    pPr = paragraph._element.get_or_add_pPr()
+    for tag, flag in (('w:keepNext', keep_next),
+                      ('w:keepLines', keep_lines),
+                      ('w:pageBreakBefore', page_break_before)):
+        node = pPr.find(qn(tag))
+        if flag:
+            if node is not None:
+                continue
+            node = OxmlElement(tag)
+            anchor = None
+            for t in ('w:numPr', 'w:spacing', 'w:ind', 'w:jc'):
+                anchor = pPr.find(qn(t))
+                if anchor is not None:
+                    break
+            if anchor is not None:
+                anchor.addprevious(node)
+            else:
+                pPr.append(node)
+        elif node is not None:
+            pPr.remove(node)
+
+
 def _set_doc_grid(section, line_pitch_twips=560):
     """声明行网格（GB/T 9704-2012 5.2.3：一般每面 22 行）。
 
@@ -314,7 +348,9 @@ def set_left_indent_chars(paragraph, chars=1):
 
 def add_paragraph(doc, text, font_name=None, font_size=SIZE_BODY,
                   bold=False, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
-                  indent=True, line_spacing=LINE_BODY):
+                  indent=True, line_spacing=LINE_BODY,
+                  keep_next=False, keep_lines=False,
+                  page_break_before=False):
     # font_name 默认 None：不能在签名里写 FONT_BODY，默认参数在定义时就绑定，
     # 字体回退改写 FONT_BODY 后不会生效。
     para = doc.add_paragraph()
@@ -324,6 +360,7 @@ def add_paragraph(doc, text, font_name=None, font_size=SIZE_BODY,
         set_first_line_indent(para, 2)
     run = para.add_run(text)
     set_font(run, font_name or FONT_BODY, font_size, bold)
+    set_pagination(para, keep_next, keep_lines, page_break_before)
     return para
 
 
@@ -955,6 +992,10 @@ def validate_content(content):
     _str_field('date', 50)
     _str_field('output', 500)
 
+    tkn = content.get('title_keep_next')
+    if tkn is not None and not isinstance(tkn, bool):
+        warns.append(f'title_keep_next：应为 true / false，实际是 {tkn!r}')
+
     tables = content.get('tables')
     if tables is None:
         tables = []
@@ -1034,6 +1075,10 @@ def validate_content(content):
             elif not isinstance(item['text'], str):
                 errors.append(f'body[{bi}].text：应为字符串，'
                               f'实际是 {type(item["text"]).__name__}')
+            for key in ('keep_next', 'keep_lines', 'page_break_before'):
+                if key in item and not isinstance(item[key], bool):
+                    warns.append(f'body[{bi}].{key}：应为 true / false，'
+                                 f'实际是 {item[key]!r}')
 
     attachments = content.get('attachments')
     if attachments is not None:
@@ -1142,6 +1187,9 @@ def build_document(content, output_path, on_exist=None):
     set_line_spacing(title_para, LINE_TITLE)
     title_run = title_para.add_run(title)
     set_font(title_run, FONT_TITLE, SIZE_TITLE)
+    # 源标题设了「与下段同页」就照写：标题掉在页末是事故，不能因为重排就丢
+    set_pagination(title_para,
+                   keep_next=bool(content.get('title_keep_next')))
 
     add_blank(doc)
 
@@ -1187,7 +1235,11 @@ def build_document(content, output_path, on_exist=None):
             add_blank(doc)
             continue
         font_role, bold = ROLE_STYLES[role]
-        add_paragraph(doc, text, font_name=font_by_role[font_role], bold=bold)
+        pag = item if isinstance(item, dict) else {}
+        add_paragraph(doc, text, font_name=font_by_role[font_role], bold=bold,
+                      keep_next=bool(pag.get('keep_next')),
+                      keep_lines=bool(pag.get('keep_lines')),
+                      page_break_before=bool(pag.get('page_break_before')))
 
     # 附件说明（7.3.4）：每个附件单独一段，回行与名称首字对齐
     attachments = [str(a).strip() for a in (content.get('attachments') or [])
