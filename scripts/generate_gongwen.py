@@ -1066,6 +1066,9 @@ def validate_content(content):
             if typ is None:
                 errors.append(f'body[{bi}]：dict 形式必须带 type 字段')
                 continue
+            if typ == 'blank':
+                # 空行是合法角色（不渲染文字），不参与角色检查、也不强求 text
+                continue
             if typ not in ROLE_ALIASES and typ not in ROLE_STYLES:
                 warns.append(f'body[{bi}].type={typ!r}：不是已知角色，'
                              f'已按正文处理（可用 '
