@@ -15,7 +15,7 @@ examples_en:
   - "Check whether the numbering hierarchy in this document is correct"
   - "Turn this text into a standard request document addressed to XX Department"
   - "Reformat this request with an attached table, keeping the original page numbering"
-version: 1.15.0
+version: 1.16.0
 author: songdianda
 user-invocable: true
 ---
@@ -50,7 +50,7 @@ user-invocable: true
 
 ## 工作流程
 
-1. **获取内容**：用户提供 `.docx` 路径时，用 `scripts/inspect_docx.py` 提取全文、样式线索与角色建议；脚本会**自动检测源文档是否已有页码**，**识别并剥离版头**（红头/发文字号/分隔线，原样保留不重排），**把落款署名与成文日期剥离到 `signature` / `date`**（生成器会重新输出，留在正文里会重复），保留表格的合并单元格结构，
+1. **获取内容**：用户提供 `.docx` 路径时，用 `scripts/inspect_docx.py` 提取全文、样式线索与角色建议；脚本会**自动检测源文档是否已有页码**，**识别并剥离版头**（红头/发文字号/分隔线，原样保留不重排），**把落款署名与成文日期就地标成 `signature` / `date` 元素**（留在源文档原位，见下），保留表格的合并单元格结构，
 并**保留段落的分页控制**（与下段同页 / 段中不分页 / 段前分页）。
    - **版头若不识别，红头会被当成标题排成二号小标宋，真正的标题反而沦为普通正文**——这一步不能跳。
    - 主送机关、附件说明**误判代价高**（删了就丢内容），脚本只列候选 `_candidates`，由你确认后填入对应字段并删除 body 中的该段。
@@ -86,7 +86,7 @@ user-invocable: true
    - 默认 `--fidelity strict`：增字与新增页码都判不通过（退出码 2）。
      确属有意补充时用 `--fidelity standard`，两者降级为提示。
    - **它不能证明版式正确**，版式仍需逐页查看。两者是两道检查，不能互相替代。
-   - 报告里会说明有意调整的部分（落款剥离、版头复制、未并入的自动编号），这些不是缺陷。
+   - 报告里会说明有意调整的部分（版头复制、未并入的自动编号、补回的自动编号），这些不是缺陷。
    - 有差异就停下核对，不要带着差异交付。
 7. **版式实测**（可选，需要 LibreOffice 与 PyMuPDF）：`python3 scripts/measure_page_number.py 成品.docx`
    把成品转成 PDF 渲染后扫描墨迹，量出页码一字线上沿距版心下边缘的毫米数（国标 7mm）。
@@ -177,11 +177,23 @@ python3 scripts/generate_gongwen.py --check-fonts
 
 居中 vs 奇偶页：7.5 的左右错位是为**双面装订**设计的——翻开书时页码靠外侧才好看。单面打印或电子传阅时页码忽左忽右反而凌乱。
 
-`type` 取值：`heading1`~`heading5`、`body`、`numbered_body`、`attachment_title`、`blank`、`table`。
+`type` 取值：`heading1`~`heading5`、`body`、`numbered_body`、`attachment_title`、
+`signature`、`date`、`blank`、`table`。
 
 其中 **`attachment_title`** 是附件另页起排时那一行标题（二号小标宋居中，GB/T 9704-2012 7.3.7）。
 印发类通知（「现将《XXX办法》印发给你们」）后面常跟着一份附件全文，其标题在源文件里
 几乎都是二号小标宋居中——原来只能拿 `heading3`（仿宋加粗）凑，差得远。
+
+**`signature` / `date` 表示落款就地输出**，位置由它在 `body` 里的下标决定。
+`inspect_docx.py` 会把源文档里识别出的落款标成这两个元素（不是删掉），
+因此通知类公文"正文→落款→附件"的结构能原样保留。把它们挪到文末会让
+成文日期掉到最后一页——这是公文里不能犯的错。
+顶层 `signature` / `date` 字段仍然写入，供不读 `body` 的调用方使用；
+`body` 里没有这两个元素时，生成器才按顶层字段在文末输出（旧行为）。
+
+**段落级对齐**：body 元素可带 `align`，取值 `left` / `center` / `right` / `justify`。
+规章、办法里的章标题（「第一章」「第二章」）通常居中，而国标公文的一级标题是
+左空二字——两种情况并存，只能按段指定，不能按角色一刀切。
 
 **分页控制**：body 元素可带 `keep_next`（与下段同页）、`keep_lines`（段中不分页）、
 `page_break_before`（段前分页），取值 `true`。源段落设了就会写进 JSON，生成器照搬到成品；
@@ -192,6 +204,11 @@ python3 scripts/generate_gongwen.py --check-fonts
 `inspect_docx.py` 默认（`fidelity: strict`）不把它并入 `text`，生成器也不会渲染它：
 源文件里它不是字符，写出来就是加字。要显示就由使用者手工补，或用 `--fidelity standard`
 重新提取（此时编号并入 `text`，`_auto_number` 中 `applied: true`）。
+
+**空行**：连续空段压成一个。源文件常在落款前后、附件前后堆好几行空段落，
+剥离与重排之后它们会连成一片（实测主送机关下面一度出现 5 个空行）。
+空行不是文字内容，压缩它不违反"一个字不增不减"。标题之前、以及 `body` 开头的
+空段直接丢弃——那是版头与标题之间的间距，照搬会把空行挪到主送机关与正文之间。
 
 **附表**：`scripts/inspect_docx.py` 会把源文档表格提取到 `tables`，并在 `body` 对应位置插 `{"type":"table","index":0}`。
 排版为居中 + 全线边框 + 表头 12 磅加粗 + 数据 10.5 磅。**表格数据必须与原文逐格一致，不得改动数值。**
@@ -252,6 +269,10 @@ python3 scripts/generate_gongwen.py --check-fonts
   文号在第 4 段，中间隔两个空行；早期版本遇到空行就停，文号检不出来，反而被
   「首个非空非版头段落」的规则当成标题——红头文件最不能错的一处
 - 识别到发文字号之后只再接受分隔线，避免把正文标题误纳入
+
+**发文字号按国标居中（7.2.4）**：这是版头"原样保留"的唯一例外。源文件常有没居中的
+发文字号，而国标明文要求它居中排布——属规定位置，不是审美偏好。生成器会在报告里
+说明改了哪一段。
 
 **识别不出、或源文件根本没有版头时，不凭空生成一个**——那需要套用单位红头模板。
 

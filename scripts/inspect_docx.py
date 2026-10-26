@@ -894,21 +894,19 @@ def build(path, strip_sign=True, fidelity=FIDELITY_DEFAULT):
             if len(t) <= 40 and t[-1] not in TERMINAL_PUNCT + '，,、':
                 sig_idx = j
             break
-    dropped = {i for i in (title_idx, sig_idx, date_idx) if i is not None}
+    # 署名与日期**不**从 body 删除，而是原地换成 signature / date 元素。
+    # 通知类公文的落款本来就在正文之后、附件之前，把它剥离到顶层字段、
+    # 由生成器统一挪到文末，会让成文日期掉到最后一页——这是公文里不能犯的错。
+    # 顶层字段照旧写入，供不读 body 的调用方使用。
+    dropped = {i for i in (title_idx,) if i is not None}
     dropped |= head_set
-    # 落款块前后的空段落一并清掉：源文件里那些用来把落款"顶下去"的空行，
-    # 生成器会在落款前后各补一个空行，留着就是一堆空段落噪音
-    anchor = sig_idx if sig_idx is not None else date_idx
-    if anchor is not None:
-        j = anchor - 1
-        while j >= 0 and j != title_idx and not paras[j]['text'].strip():
-            dropped.add(j)
-            j -= 1
-        for j in range((date_idx if date_idx is not None else anchor) + 1, len(paras)):
+    # 标题之前的空段落是版头与标题之间的间距，不是正文内容。
+    # 留着它们，正文会凭空多出一段空白——实测源文件主送机关与正文紧邻，
+    # 搬完这几个空行后中间就隔了一行。
+    if title_idx is not None:
+        for j in range(0, title_idx):
             if not paras[j]['text'].strip():
                 dropped.add(j)
-            else:
-                break
 
     # 主送机关 / 附件说明：误判代价高（删了就丢内容），**只提候选不自动剥离**
     body = []
@@ -922,6 +920,17 @@ def build(path, strip_sign=True, fidelity=FIDELITY_DEFAULT):
             continue
         sig = paras[i]
         if i in dropped:
+            continue
+        # 落款就地占位：保留源文档里"正文之后、附件之前"这个位置
+        if strip_sign and i == sig_idx:
+            body.append({'type': 'signature',
+                         'text': (sig['raw_text'] if strict
+                                  else sig['text']).strip()})
+            continue
+        if strip_sign and i == date_idx:
+            body.append({'type': 'date',
+                         'text': (sig['raw_text'] if strict
+                                  else sig['text']).strip()})
             continue
         # disp 只用于判读（含自动编号，能看出「二、」这类层级）；
         # 输出用 text：strict 下是原文字符本身，一个字都不加
@@ -961,6 +970,17 @@ def build(path, strip_sign=True, fidelity=FIDELITY_DEFAULT):
         if conf != 'high':
             uncertain.append({'index': sig['index'], 'text': disp[:60],
                               'suggested': role, 'reason': reason})
+
+    # 去掉 body 开头的连续空段。标题与正文之间的留白由生成器统一给一个，
+    # 照搬源文档那几个空行会挪错位置——主送机关单独渲染在 body 之外，
+    # 源文件"标题→空→主送→正文"会被排成"标题→空→主送→空→正文"。
+    k = 0
+    while k < len(body) and isinstance(body[k], dict) \
+            and body[k].get('type') in (None, 'blank', 'body') \
+            and not (body[k].get('text') or '').strip():
+        k += 1
+    if k:
+        body = body[k:]
 
     if title_idx is None:
         title = ''

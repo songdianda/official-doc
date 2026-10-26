@@ -508,8 +508,9 @@ def main():
     if meta:
         st = meta.get('_stripped') or []
         if st:
-            notes.append('落款已剥离后由生成器重新输出：'
-                         + '、'.join(f"{s['field']}「{s['text']}」" for s in st))
+            notes.append('落款留在源文档原位（正文之后、附件之前）输出：'
+                         + '、'.join(f"{s['field']}「{s['text']}」" for s in st)
+                         + '；若成品中它被排在文末，说明落款位置丢了')
         an = meta.get('_auto_number') or []
         applied = [a for a in an if a.get('applied')]
         skipped = [a for a in an if not a.get('applied')]

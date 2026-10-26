@@ -23,6 +23,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Mm, Pt
+from docx.text.paragraph import Paragraph
 from lxml import etree
 
 # ── 排版常量（依据 GB/T 9704-2012） ──────────────────────
@@ -80,6 +81,28 @@ ROLE_STYLES = {
 
 # 居中排的角色：正文类角色一侓两端对齐，只有附件标题要居中
 CENTER_ROLES = {'attachment_title'}
+
+# 落款元素：放在 body 里表示"就在源文档的这个位置输出"，而不是甩到文末
+SIGN_ROLES = {'signature', 'date'}
+
+# 段落级 align 字段允许的取值（公文只用得到这四种）
+ALIGN_MAP = {
+    'left': WD_ALIGN_PARAGRAPH.LEFT,
+    'center': WD_ALIGN_PARAGRAPH.CENTER,
+    'right': WD_ALIGN_PARAGRAPH.RIGHT,
+    'justify': WD_ALIGN_PARAGRAPH.JUSTIFY,
+    '两端对齐': WD_ALIGN_PARAGRAPH.JUSTIFY,
+    '居中': WD_ALIGN_PARAGRAPH.CENTER,
+    '居左': WD_ALIGN_PARAGRAPH.LEFT,
+    '居右': WD_ALIGN_PARAGRAPH.RIGHT,
+}
+
+
+def resolve_align(value):
+    """把 align 字段转成对齐枚举；未指定或无法识别返回 None（用角色默认值）。"""
+    if value is None:
+        return None
+    return ALIGN_MAP.get(str(value).strip().lower())
 
 # 旧字段名兼容
 ROLE_ALIASES = {
@@ -187,6 +210,8 @@ def resolve_role(item):
     role = ROLE_ALIASES.get(role, role)
     if role == 'blank':
         return text, 'blank'
+    if role in SIGN_ROLES:
+        return text, role          # 落款就地输出，保留位置
     if role not in ROLE_STYLES:
         # 未知角色：不猜，按最安全的正文处理
         role = 'body'
@@ -383,6 +408,26 @@ def add_blank(doc, line_spacing=LINE_BODY):
 _NUM_PREFIX_CHARS = 1.5
 
 
+def _add_signature_para(doc, text):
+    """发文机关署名：右对齐、右空二字（7.3.5）。"""
+    para = doc.add_paragraph()
+    para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    set_line_spacing(para, LINE_BODY)
+    set_right_indent_chars(para, 2)
+    set_font(para.add_run(text), FONT_BODY, SIZE_BODY)
+    return para
+
+
+def _add_date_para(doc, text):
+    """成文日期：右对齐、右空四字（7.3.5）。"""
+    para = doc.add_paragraph()
+    para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    set_line_spacing(para, LINE_BODY)
+    set_right_indent_chars(para, 4)
+    set_font(para.add_run(text), FONT_BODY, SIZE_BODY)
+    return para
+
+
 def _add_attachment_para(doc, prefix, name, left, hanging):
     """附件说明一行。
 
@@ -399,6 +444,9 @@ def _add_attachment_para(doc, prefix, name, left, hanging):
     set_font(run, FONT_BODY, SIZE_BODY)
     return para
 
+
+# 发文字号：机关代字 + 〔年份〕+ 序号 + 号（GB/T 9704-2012 7.2.5）
+DOC_NUMBER_RE = re.compile(r'^.{1,20}〔\d{4}〕\d+号$')
 
 # VML（老式 w:pict 图片）命名空间，python-docx 的 nsmap 里没有，需手写
 VML_NS = 'urn:schemas-microsoft-com:vml'
@@ -584,8 +632,12 @@ def _letterhead_fonts(src_doc, indices):
 def copy_letterhead(doc, spec):
     """把源文档的版头（红头 / 发文字号 / 分隔线）原样复制到新文档开头。
 
-    整段 deepcopy w:p，字体、颜色、字号、对齐、边框一概照搬。
+    整段 deepcopy w:p，字体、颜色、字号、边框一概照搬。
     红头是各单位的门面，本技能**不重做红头**——重排等于替用户改门面。
+
+    唯一例外是**发文字号**：GB/T 9704-2012 7.2.4 要求它"居中排布"，
+    而源文件常有没居中的（居左或随默认）。这是国标明文规定的位置，
+    不是审美偏好，所以照国标纠正，并在生成报告里说明改了什么。
     """
     import copy as copy_mod
 
@@ -598,6 +650,7 @@ def copy_letterhead(doc, spec):
         return 0
 
     src = Document(src_path)
+    centered = []
 
     # 先同步文档默认字体：版头里没显式设字体的 run 靠它兜底，
     # 不复制过来就会在新文档里换成别的字体（表现为"红头变样"）。
@@ -622,8 +675,17 @@ def copy_letterhead(doc, spec):
             body.append(new_p)
         copied += 1
 
+        # 发文字号按国标居中（7.2.4）
+        para = Paragraph(new_p, doc)
+        if DOC_NUMBER_RE.match(para.text.strip()):
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            centered.append(para.text.strip())
+
     if copied:
         _report_letterhead_fonts(src, indices)
+    if centered:
+        print(f'✓ 发文字号已按国标居中排布（7.2.4）：'
+              + '、'.join(centered))
     return copied
 
 
@@ -1099,7 +1161,8 @@ def validate_content(content):
             if typ == 'blank':
                 # 空行是合法角色（不渲染文字），不参与角色检查、也不强求 text
                 continue
-            if typ not in ROLE_ALIASES and typ not in ROLE_STYLES:
+            if typ not in ROLE_ALIASES and typ not in ROLE_STYLES \
+                    and typ not in SIGN_ROLES:
                 warns.append(f'body[{bi}].type={typ!r}：不是已知角色，'
                              f'已按正文处理（可用 '
                              f'{", ".join(sorted(ROLE_STYLES))}）')
@@ -1265,6 +1328,8 @@ def build_document(content, output_path, on_exist=None):
                     'title': FONT_TITLE}
     tables = content.get('tables') or []
     used_tables = set()
+    sign_in_body = False                 # 落款是否已在 body 原位出现
+    blank_run = 0                        # 连续空段计数
 
     for item in content.get('body', []):
         # 表格占位：{"type": "table", "index": 0}
@@ -1288,15 +1353,39 @@ def build_document(content, output_path, on_exist=None):
             continue
 
         text, role = resolve_role(item)
+
+        # 落款就地输出：源文档把它放在正文中部（通知正文之后、附件之前）
+        # 是常态，统一甩到文末会让成文日期跑到最后一页。
+        if role == 'signature':
+            sign_in_body = True
+            blank_run = 0
+            _add_signature_para(doc, text)
+            continue
+        if role == 'date':
+            sign_in_body = True
+            blank_run = 0
+            _add_date_para(doc, text)
+            continue
+
         if role == 'blank' or not text.strip():
+            # 连续空行压成一个。源文件常在落款前后、附件前后堆好几行空段落，
+            # 剥离落款之后它们会连成一片——实测主送机关下面一度出现 5 个空行。
+            # 空行不是文字内容，压缩它不违反"一个字不增不减"。
+            blank_run += 1
+            if blank_run > 1:
+                continue
             add_blank(doc)
             continue
+        blank_run = 0
         font_role, bold = ROLE_STYLES[role]
         pag = item if isinstance(item, dict) else {}
+        # 段落级对齐覆盖：章标题（「第一章」「第二章」）在规章、办法里通常居中，
+        # 而国标公文的一级标题是左空二字——两种情况并存，只能按段指定。
+        align = resolve_align(pag.get('align'))
         if role in CENTER_ROLES:
             # 附件标题：二号小标宋居中，用标题行距，不首行缩进
             para = doc.add_paragraph()
-            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            para.alignment = align or WD_ALIGN_PARAGRAPH.CENTER
             set_line_spacing(para, LINE_TITLE)
             run = para.add_run(text)
             set_font(run, font_by_role[font_role], SIZE_TITLE)
@@ -1305,6 +1394,7 @@ def build_document(content, output_path, on_exist=None):
                            bool(pag.get('page_break_before')))
             continue
         add_paragraph(doc, text, font_name=font_by_role[font_role], bold=bold,
+                      align=align or WD_ALIGN_PARAGRAPH.JUSTIFY,
                       keep_next=bool(pag.get('keep_next')),
                       keep_lines=bool(pag.get('keep_lines')),
                       page_break_before=bool(pag.get('page_break_before')))
@@ -1330,24 +1420,17 @@ def build_document(content, output_path, on_exist=None):
                                          left=cont, hanging=_NUM_PREFIX_CHARS)
 
     # 发文机关署名与成文日期（7.3.5）
+    # body 里若已显式放了 signature / date 元素（源文档落款在正文中部，
+    # 通知正文之后、附件之前），则不再在文末重复输出——把日期甩到最后一页
+    # 是公文里不能犯的错。
     signature = content.get('signature')
     date = content.get('date')
-    if signature or date:
+    if (signature or date) and not sign_in_body:
         add_blank(doc)
-    if signature:
-        sig_para = doc.add_paragraph()
-        sig_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        set_line_spacing(sig_para, LINE_BODY)
-        set_right_indent_chars(sig_para, 2)   # 右空二字
-        sig_run = sig_para.add_run(signature)
-        set_font(sig_run, FONT_BODY, SIZE_BODY)
-    if date:
-        date_para = doc.add_paragraph()
-        date_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        set_line_spacing(date_para, LINE_BODY)
-        set_right_indent_chars(date_para, 4)   # 成文日期右空四字
-        date_run = date_para.add_run(date)
-        set_font(date_run, FONT_BODY, SIZE_BODY)
+        if signature:
+            _add_signature_para(doc, signature)
+        if date:
+            _add_date_para(doc, date)
 
     # 未在 body 中显式定位的表格，追加到文末（落款之后）
     for idx, t in enumerate(tables):
