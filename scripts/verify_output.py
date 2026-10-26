@@ -54,8 +54,13 @@ from inspect_docx import extract_table         # noqa: E402
 
 
 def _norm(s):
-    """去掉所有空白后比较，避免 Word 换行、空格差异造成误报。"""
-    return re.sub(r'\s+', '', s or '')
+    """把连续空白折叠成一个空格，再 trim，用于精确比较。
+
+    只折叠空白，**不做子串匹配**——完整文字是默认口径。
+    「检测结果不合格，禁止投入使用。」和「检测结果」必须判为不同，
+    不能因为后者是前者子串就放行（那是截断/少字，要拦截）。
+    """
+    return re.sub(r'\s+', ' ', (s or '')).strip()
 
 
 def _all_text(el):
@@ -99,6 +104,37 @@ def _is_page_number(el):
         if 'PAGE' in (t.text or '').upper():
             return True
     return False
+
+
+def _header_footer_text(el):
+    """提取页眉/页脚元素里的**非页码**文字。
+
+    页码域（w:instrText 含 PAGE）及其缓存数字不是内容，页码单独比对；
+    但页脚里除了页码域之外的文字（如「内部资料，请勿外传」「机密」）
+    是真实内容，必须参与验收——不能因为页脚含 PAGE 域就整段跳过。
+
+    做法：按 run 遍历。一个 run 若含域标记（w:fldChar / w:instrText）
+    或其内容看起来就是 PAGE 域渲染出的纯数字缓存，则跳过；否则保留文字。
+    """
+    def _is_field_run(r):
+        return any(True for _ in r.iter(qn('w:fldChar'))) or \
+               any(True for _ in r.iter(qn('w:instrText')))
+
+    parts = []
+    for p in el.iter(qn('w:p')):
+        has_page = any('PAGE' in (t.text or '').upper()
+                       for t in p.iter(qn('w:instrText')))
+        for r in p.iter(qn('w:r')):
+            if _is_field_run(r):
+                continue            # 域代码 / 域开关本身不是正文文字
+            for t in r.iter(qn('w:t')):
+                txt = (t.text or '').strip()
+                if not txt:
+                    continue
+                if has_page and re.fullmatch(r'[0-9]{1,4}', txt):
+                    continue        # 页码域的缓存数字，页码单独比对
+                parts.append(t.text)
+    return re.sub(r'\s+', ' ', ''.join(parts)).strip()
 
 
 def _count_shapes(el):
@@ -146,6 +182,31 @@ def image_stats(path):
     return stats
 
 
+def numbering_marks(path):
+    """统计正文里带自动编号（w:numPr）的段落，返回 [(文本, numId, ilvl)]。
+
+    自动编号不是字符，`p.text` 读不到——必须看 w:numPr 才能知道这段
+    有没有编号、编到哪一级。验收据此判断编号是否丢失。
+    """
+    doc = Document(path)
+    marks = []
+    for p in doc.paragraphs:
+        pPr = p._element.pPr
+        if pPr is None:
+            continue
+        numPr = pPr.find(qn('w:numPr'))
+        if numPr is None:
+            continue
+        ilvl = numPr.find(qn('w:ilvl'))
+        numid = numPr.find(qn('w:numId'))
+        marks.append({
+            'text': _all_text(p._element),
+            'numId': numid.get(qn('w:val')) if numid is not None else None,
+            'ilvl': ilvl.get(qn('w:val')) if ilvl is not None else None,
+        })
+    return marks
+
+
 # ── 直接从文档读原文（不依赖任何提取结果）─────────────────
 
 def raw_source(path):
@@ -174,9 +235,9 @@ def raw_source(path):
                                   'zone': '表格'})
 
     for el in _classify(doc)['header_footer']:
-        text = _all_text(el)
-        # 页码域的缓存值（页脚里那个「8」）不是内容，页码单独比对
-        if text and not _is_page_number(el):
+        text = _header_footer_text(el)
+        # 页眉页脚里的文字（页码域除外）是真实内容，参与必须通过的验收
+        if text:
             items.append({'text': text, 'where': '页眉/页脚',
                           'zone': '页眉页脚'})
     for el in _classify(doc)['other']:
@@ -200,56 +261,101 @@ def target_texts(path):
         for row in rows:
             out.extend(v.strip() for v in row if v.strip())
     zones = _classify(doc)
-    for key in ('header_footer', 'other'):
-        for el in zones[key]:
-            text = _all_text(el)
-            if text:
-                out.append(text)
+    for el in zones['header_footer']:
+        text = _header_footer_text(el)
+        if text:
+            out.append(text)
+    for el in zones['other']:
+        text = _all_text(el)
+        if text:
+            out.append(text)
     return out
 
 
 def match_one(text, pool):
-    """在 pool 中找一条能覆盖 text 的记录（互为子串即算命中）。
+    """在 pool 中找一条**精确相等**（空白折叠后）的记录。
 
-    命中后把该条从 pool 里消耗掉：源里有两段相同的文字，成品只有一段时，
-    第二段会找不到配对，从而暴露"少了一段"——只比集合是发现不了的。
+    默认完整文字比较，不再互为子串放行。命中后把该条从 pool 消耗掉：
+    源里有两段相同文字、成品只有一段时，第二段找不到配对，从而暴露
+    「少了一段」——只比集合发现不了，靠消耗来保留重复段落的次数。
     """
     n = _norm(text)
     if not n:
         return True
     for i, cand in enumerate(pool):
-        if n in _norm(cand) or _norm(cand) in n:
+        if _norm(cand) == n:
             pool.pop(i)
             return True
     return False
 
 
-def match_extra(text, pool):
-    """反向配对：成品一段文字在源 pool 里找对应，返回**源里没有的字符**。
+def _diff_detail(src, dst):
+    """给出源与成品的文字差异描述（少字/多字/替换）。
 
-    match_one 只回答"找不找得到"，互为子串就算命中——给段落加个「二、」
-    前缀，正向检查照样通过。这里把配对后剩余的前后缀算出来，
-    那才是真正多出来的字。
-      返回 ''    没有增字
-      返回 非空   增字内容（可能是整段，源里完全找不到）
+    返回 (kind, detail)：
+      kind ∈ 'equal' / 'missing'(少字) / 'extra'(多字) / 'replaced'(替换)
+    detail 为可读描述，含原文与成品片段。
+    """
+    s, d = _norm(src), _norm(dst)
+    if s == d:
+        return 'equal', ''
+    if not s:
+        return 'extra', f'源为空，成品多出「{d[:40]}」'
+    if not d:
+        return 'missing', f'源「{s[:40]}」在成品中缺失'
+    if s in d:
+        # 成品比源多：定位多出的前后缀
+        idx = d.find(s)
+        extra = (d[:idx] + d[idx + len(s):]).strip()
+        return 'extra', f'成品多出「{extra[:40]}」'
+    if d in s:
+        # 成品比源少：源的一部分被截断
+        idx = s.find(d)
+        missing = (s[:idx] + s[idx + len(d):]).strip()
+        return 'missing', f'缺失「{missing[:40]}」'
+    # 中间替换：用 difflib 找第一个不同片段
+    import difflib
+    sm = difflib.SequenceMatcher(None, s, d)
+    first = None
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != 'equal':
+            first = (tag, s[i1:i2], d[j1:j2])
+            break
+    if first:
+        tag, a, b = first
+        if tag == 'delete':
+            return 'missing', f'缺失「{a[:40]}」（源「{s[:30]}」→ 成品「{d[:30]}」）'
+        if tag == 'insert':
+            return 'extra', f'多出「{b[:40]}」（源「{s[:30]}」→ 成品「{d[:30]}」）'
+        return 'replaced', f'「{a[:20]}」→「{b[:20]}」（源「{s[:30]}」→ 成品「{d[:30]}」）'
+    return 'replaced', f'源「{s[:40]}」→ 成品「{d[:40]}」'
+
+
+def match_extra(text, pool):
+    """反向配对：成品一段文字在源 pool 里找精确对应。
+
+    精确匹配不上就给出可读差异描述（少字/多字/替换），不再把「成品是源
+    子串」判为 0 增字——少字要在这里被拦住，而不是推给正向检查。
+    找不到任何相近源段时返回整段原文（视为整段新增）。
     """
     n = _norm(text)
     if not n:
         return ''
-    # 先精确匹配，再退到子串，避免把带前后缀的段落误配给另一段
     for i, cand in enumerate(pool):
         if _norm(cand) == n:
             pool.pop(i)
             return ''
+    # 没精确匹配上：找最接近的一条源段给出可读差异
+    import difflib
+    best_i, best_ratio = None, 0.0
     for i, cand in enumerate(pool):
-        c = _norm(cand)
-        if n in c:            # 成品是源的子串：成品少字，由正向检查负责
-            pool.pop(i)
-            return ''
-        if c in n:
-            pool.pop(i)
-            idx = n.find(c)
-            return n[:idx] + n[idx + len(c):]
+        ratio = difflib.SequenceMatcher(None, n, _norm(cand)).ratio()
+        if ratio > best_ratio:
+            best_i, best_ratio = i, ratio
+    if best_i is not None and best_ratio >= 0.5:
+        cand = pool.pop(best_i)
+        kind, detail = _diff_detail(cand, text)
+        return detail if kind != 'equal' else n
     return n                  # 源里完全没有 → 整段都是新增
 
 
@@ -265,6 +371,50 @@ def body_texts(path):
         if text:
             out.append({'text': text, 'where': f'成品正文段落[{i}]'})
     return out
+
+
+def source_body_ordered(path):
+    """源文档正文段落（zone=正文）的有序文字序列，用于顺序校验。
+
+    返回 [text, ...]，保留出现次序与重复次数。
+    """
+    doc = Document(path)
+    out = []
+    for p in doc.paragraphs:
+        text = _all_text(p._element)
+        if text:
+            out.append(text)
+    return out
+
+
+def check_order(src_seq, dst_seq):
+    """检测正文段落顺序是否变化（未经允许的段落顺序变化）。
+
+    思路：先看源与成品正文段落的内容**多重集合**（含重复）是否一致。
+    一致但**序列**不同 → 内容没丢没增，但发生了重排，必须报告。
+    集合不一致 → 交给原文覆盖 / 反向检查负责，这里不重复报。
+
+    返回 (是否一致, 差异描述列表)。
+    """
+    from collections import Counter
+    sn = [_norm(x) for x in src_seq]
+    dn = [_norm(x) for x in dst_seq]
+    if Counter(sn) != Counter(dn):
+        # 内容本身有增删，顺序问题由覆盖/反向检查覆盖，此处不重复报
+        return True, []
+    if sn == dn:
+        return True, []
+    # 集合一致但序列不同 → 重排。逐位找第一个不一致的位置
+    reorders = []
+    for i, (a, b) in enumerate(zip(sn, dn)):
+        if a != b:
+            reorders.append(
+                f'第{i + 1}段起顺序变化：源「{src_seq[i][:25]}」'
+                f'↔ 成品「{dst_seq[i][:25]}」')
+            break
+    if not reorders and len(sn) != len(dn):
+        reorders.append('段落数量一致但顺序不同')
+    return (not reorders), reorders
 
 
 def page_number_marks(path):
@@ -371,6 +521,7 @@ def main():
 
     ok = True
     warns = []
+    partial = []          # 部分完成/待确认（不支持内容、无法判定的内容）
     print('──────── 内容验收报告 ────────')
     print(f'源文件：{os.path.basename(args.source)}')
     print(f'成品　：{os.path.basename(args.target)}')
@@ -385,8 +536,10 @@ def main():
             missing.append(it)
     print(f'\n【原文覆盖】源文档 {len(src_items)} 条文字，逐条在成品中查找')
     if missing:
-        hard = [m for m in missing if m['zone'] in ('正文', '表格')]
-        soft = [m for m in missing if m['zone'] not in ('正文', '表格')]
+        # 正文、表格、页眉页脚都是"必须保留"的内容，丢失判不通过；
+        # 只有"其他"（脚注/尾注/批注）属本技能不处理的内容 → 部分完成
+        hard = [m for m in missing if m['zone'] in ('正文', '表格', '页眉页脚')]
+        soft = [m for m in missing if m['zone'] == '其他']
         if hard:
             ok = False
             print(f'  成品中找不到 {len(hard)} 条（内容丢失）：')
@@ -394,19 +547,17 @@ def main():
                 mark = ''
                 if meta and not match_one(m['text'], jpool):
                     mark = '　[提取结果里也没有 → 漏在提取环节，不是排版环节]'
-                print(f'    × {m["where"]}  {m["text"][:60]}{mark}')
+                print(f'    × {m["where"]}  「{m["text"][:60]}」{mark}')
             if len(hard) > 20:
                 print(f'    …… 另有 {len(hard) - 20} 条')
         if not hard:
-            print('  正文与表格文字均可在成品中找到'
-                  '（页眉页脚 / 脚注等缺失见文末提示，不计入失败）')
-        for zone in ('页眉页脚', '其他'):
-            group = [m for m in soft if m['zone'] == zone]
-            if group:
-                warns.append(
-                    f'{zone}文字 {len(group)} 条未进入成品'
-                    f'（本技能不复制{zone}内容，需手工补回）：'
-                    + '、'.join(m['text'][:20] for m in group[:5]))
+            print('  正文、表格、页眉页脚文字均可在成品中找到'
+                  '（脚注/尾注/批注等缺失见文末提示）')
+        if soft:
+            partial.append(
+                f'脚注/尾注/批注文字 {len(soft)} 条未进入成品'
+                f'（本技能不处理这些内容，需手工补回）：'
+                + '、'.join(m['text'][:20] for m in soft[:5]))
     else:
         print('  源文档全部文字均可在成品中找到')
 
@@ -423,7 +574,7 @@ def main():
     if not extras:
         print('  成品正文没有源文档以外的字符')
     else:
-        head = ('  发现 %d 段含源文档没有的字符（增字）：' % len(extras))
+        head = ('  发现 %d 段与源文档不符（少字/多字/替换）：' % len(extras))
         if strict:
             ok = False
             print(head)
@@ -431,9 +582,21 @@ def main():
             warns.append(head.strip())
             print(head + '（standard 模式，记为提示）')
         for it, more in extras[:20]:
-            print(f'    × {it["where"]} 多出「{more[:40]}」｜整段：{it["text"][:50]}')
+            print(f'    × {it["where"]}  {more}｜成品整段：{it["text"][:50]}')
         if len(extras) > 20:
             print(f'    …… 另有 {len(extras) - 20} 段')
+
+    # ── 2b. 段落顺序：未经允许的重排 ────────────────────
+    src_seq = source_body_ordered(args.source)
+    dst_seq = [it['text'] for it in dst_body]
+    order_ok, reorders = check_order(src_seq, dst_seq)
+    if reorders:
+        ok = False
+        print(f'\n【段落顺序】发现 {len(reorders)} 处未经允许的段落顺序变化：')
+        for r in reorders[:20]:
+            print(f'    × {r}')
+        if len(reorders) > 20:
+            print(f'    …… 另有 {len(reorders) - 20} 处')
 
     # ── 页码：源文档没有就不该有 ────────────────────────
     src_pn = page_number_marks(args.source)
@@ -450,8 +613,8 @@ def main():
         print('  确认要加页码的话：这是你显式指定的，可忽略；'
               '否则检查 config 里的 page_number 是否被误设为 center / odd_even')
     elif src_pn and not dst_pn:
-        warns.append('源文档有页码，成品没有 —— 页码未保留')
-        print('\n【页码】源文档有页码，成品未保留')
+        ok = False
+        print('\n【页码】源文档有页码，成品未保留 —— 可见内容丢失，判不通过')
     else:
         print('\n【页码】源与成品一致'
               + ('（均无页码域）' if not src_pn else '（均含页码域）'))
@@ -503,6 +666,30 @@ def main():
     if (si['body'], si['header_footer']) == (di['body'], di['header_footer']):
         print('  正文与页眉页脚图片数量一致')
 
+    # ── 3b. 自动编号（numPr）：可见编号是否保留 ──────────
+    src_num = numbering_marks(args.source)
+    dst_num = numbering_marks(args.target)
+    print(f'\n【自动编号】源 {len(src_num)} 段 / 成品 {len(dst_num)} 段带 Word 自动编号')
+    if src_num and not dst_num:
+        ok = False
+        print('  源文档有自动编号，成品全部丢失 —— 可见编号与层级缺失，判不通过')
+    elif len(dst_num) < len(src_num):
+        ok = False
+        print(f'  成品自动编号段落少于源（源 {len(src_num)}、成品 {len(dst_num)}）'
+              f' —— 部分编号丢失，判不通过')
+    elif src_num:
+        # 逐段核对：源每段带编号的段落，成品里应有对应编号（按文本配对）
+        src_texts = {m['text'] for m in src_num}
+        dst_texts = {m['text'] for m in dst_num}
+        lost = src_texts - dst_texts
+        if lost:
+            ok = False
+            print(f'  以下段落的编号在成品中缺失：')
+            for t in list(lost)[:10]:
+                print(f'    × 「{t[:40]}」')
+        else:
+            print('  自动编号段落已保留（编号由 Word 渲染，非正文字符）')
+
     # ── 有意调整 ───────────────────────────────────────
     notes = []
     if meta:
@@ -513,36 +700,47 @@ def main():
                          + '；若成品中它被排在文末，说明落款位置丢了')
         an = meta.get('_auto_number') or []
         applied = [a for a in an if a.get('applied')]
-        skipped = [a for a in an if not a.get('applied')]
         if applied:
             notes.append(f'Word 自动编号 {len(applied)} 处已补回为文字'
                          f'（源文件里不是字符，属 standard 模式的有意补充）')
-        if skipped:
-            notes.append(f'Word 自动编号 {len(skipped)} 处【未并入正文】'
-                         f'（严格保真：源文档里没有这几个字）：'
-                         + '、'.join(f'第{a["index"]}段「{a["text"]}」'
-                                     for a in skipped[:5])
-                         + ('…' if len(skipped) > 5 else '')
-                         + '　需手工补或改用 --fidelity standard')
         if meta.get('header'):
             n = len(meta['header']['indices'])
             notes.append(f'版头 {n} 段整段原样复制；'
                          f'若含文本框，其中文字已按全文 w:t 参与比对，'
                          f'框体与位置仍需目视确认')
         for u in (meta.get('_unsupported') or []):
-            notes.append(f"源文档含「{u['kind']}」{u['count']} 处：{u['hint']}")
+            # 不支持的内容（图片/脚注/公式等）本技能不保留，
+            # 属「部分完成／待确认」，不能算完全通过
+            partial.append(
+                f"源文档含「{u['kind']}」{u['count']} 处：{u['hint']}")
     notes.extend(warns)
     if notes:
         print('\n【有意调整 / 需留意】')
         for n in notes:
             print(f'  - {n}')
+    if partial:
+        print('\n【部分完成 / 待确认】')
+        for p in partial:
+            print(f'  ! {p}')
 
-    verdict = ('内容一致：未发现漏字、增字、漏表、漏图'
-               + ('，也未新增页码' if strict else '')
-               if ok else '存在内容差异，请按上述条目核对后再交付')
+    # 三类结论 + 三档退出码：
+    #   0 完全通过     —— 无内容丢失、无增字、无未处理内容
+    #   1 部分完成     —— 存在本技能不处理/无法确认的内容（脚注、批注、图片等）
+    #   2 不通过       —— 存在内容丢失、增字、替换、漏表、漏图等硬差异
+    if not ok:
+        verdict = '不通过：存在内容差异，请按上述条目核对后再交付'
+        code = 2
+    elif partial:
+        verdict = '部分完成／待确认：正文、表格、页眉页脚文字与图片均一致，' \
+                  '但存在本技能未处理或无法确认的内容，请核对后决定是否交付'
+        code = 1
+    else:
+        verdict = ('完全通过：未发现漏字、增字、漏表、漏图'
+                   + ('，也未新增页码' if strict else ''))
+        code = 0
     print('\n结论：' + verdict)
     print('注意：本脚本只比对内容，不能证明版式正确，版式仍需逐页查看。')
-    return 0 if ok else 2
+    return code
 
 
 if __name__ == '__main__':

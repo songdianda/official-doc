@@ -153,6 +153,38 @@ def load_numbering_defs(doc):
     return nums
 
 
+def dump_numbering_xml(doc):
+    """导出源文档 numbering.xml 的完整定义，供生成器移植。
+
+    返回 dict：{numId: {'abstractNumId', 'xml', 'levels'}}，其中 xml 是
+    <w:num> 整段的序列化字符串，levels 是该 numId 下各 ilvl 的定义。
+    复制时需对 numId / abstractNumId 重映射，避免与目标文档冲突。
+    """
+    try:
+        part = doc.part.numbering_part
+    except Exception:
+        return {}
+    if part is None:
+        return {}
+    root = part.element
+
+    abstracts = {}
+    for a in root.iter(qn('w:abstractNum')):
+        aid = a.get(qn('w:abstractNumId'))
+        abstracts[aid] = etree.tostring(a, encoding='unicode')
+
+    out = {}
+    for n in root.iter(qn('w:num')):
+        numid = n.get(qn('w:numId'))
+        aid_el = n.find(qn('w:abstractNumId'))
+        aid = aid_el.get(qn('w:val')) if aid_el is not None else None
+        out[numid] = {
+            'abstractNumId': aid,
+            'xml': etree.tostring(n, encoding='unicode'),
+        }
+    return {'abstracts': abstracts, 'nums': out}
+
+
 def load_style_numbering(doc):
     """解析 styles.xml → {styleId: numPr元素}（沿 basedOn 继承链向上找）。
 
@@ -1019,10 +1051,16 @@ def build(path, strip_sign=True, fidelity=FIDELITY_DEFAULT):
 
         role, conf, reason = suggest(sig)
         item = {'type': role, 'text': text}
-        # strict 下自动编号不并入正文，但要把"这段其实有编号"记下来：
-        # 使用者据此决定要不要手工补，脚本不替他加
-        if strict and sig.get('auto_prefix'):
-            item['num_prefix'] = sig['auto_prefix']
+        # 自动编号：把 numId / ilvl 提升为正式字段，供生成器保留原生编号。
+        # strict 下编号不并入正文字符，但 numId/ilvl 会随 numbering 定义
+        # 一起带到成品，由 Word 原生渲染出「一、」「1.」等序号——
+        # 这样既不加字，也不丢可见编号。
+        auto = sig.get('autoNumber')
+        if auto:
+            item['num_id'] = auto.get('numId')
+            item['num_ilvl'] = auto.get('ilvl')
+            if strict and sig.get('auto_prefix'):
+                item['num_prefix'] = sig['auto_prefix']
         # 分页控制原样带走：源段落设了「与下段同页」，成品也要设，否则标题会掉页底
         item.update(_para_pagination(elements[i]))
         item['_src'] = {
@@ -1151,6 +1189,10 @@ def build(path, strip_sign=True, fidelity=FIDELITY_DEFAULT):
         result['_page_number'] = pn['detail']
     if auto_numbered:
         result['_auto_number'] = auto_numbered
+    # 自动编号定义：完整导出 numbering.xml，供生成器原生保留编号。
+    # 只在确实有自动编号时才导出，避免无编号文档多一个空字段。
+    if auto_numbered:
+        result['_numbering'] = dump_numbering_xml(doc)
     for u in unsupported:
         idx = u['index'][:5]
         more = '…' if u['count'] > 5 else ''

@@ -305,6 +305,82 @@ def _set_doc_grid(section, line_pitch_twips=560):
     docGrid.set(qn('w:linePitch'), str(line_pitch_twips))
 
 
+def set_numbering(paragraph, num_id, ilvl):
+    """给段落设置 Word 自动编号（w:numPr）。
+
+    保留源文档的自动编号：编号不是字符，由 Word 按 numbering 定义渲染。
+    需配合 apply_numbering 把源编号定义复制进目标文档，并对 numId 做重映射。
+    """
+    if num_id is None:
+        return
+    pPr = paragraph._element.get_or_add_pPr()
+    numPr = pPr.find(qn('w:numPr'))
+    if numPr is None:
+        numPr = OxmlElement('w:numPr')
+        pPr.append(numPr)
+    else:
+        for t in ('w:ilvl', 'w:numId'):
+            e = numPr.find(qn(t))
+            if e is not None:
+                numPr.remove(e)
+    il = OxmlElement('w:ilvl')
+    il.set(qn('w:val'), str(ilvl if ilvl is not None else 0))
+    ni = OxmlElement('w:numId')
+    ni.set(qn('w:val'), str(num_id))
+    numPr.append(il)
+    numPr.append(ni)
+
+
+def apply_numbering(doc, numbering):
+    """把源文档的自动编号定义复制进目标文档，返回 {旧numId: 新numId} 映射。
+
+    numbering 为 inspect_docx.dump_numbering_xml 的产物，形如
+    {'abstracts': {aid: xml}, 'nums': {numId: {'abstractNumId', 'xml'}}}。
+
+    目标文档（python-docx 默认模板）已有 numbering part，这里在其后追加：
+      1. 复制 abstractNum，重映射 abstractNumId（避免与已有冲突）
+      2. 复制 num，重映射 numId 和 abstractNumId 引用
+    返回映射供 set_numbering 用新 numId。
+    """
+    if not numbering or not numbering.get('nums'):
+        return {}
+    try:
+        part = doc.part.numbering_part
+    except Exception:
+        part = None
+    if part is None:
+        return {}
+
+    root = part.element
+    existing_aid = {int(a.get(qn('w:abstractNumId')) or 0)
+                    for a in root.iter(qn('w:abstractNum'))}
+    existing_nid = {int(n.get(qn('w:numId')) or 0)
+                    for n in root.iter(qn('w:num'))}
+    aid_offset = (max(existing_aid) + 1) if existing_aid else 0
+    nid_offset = (max(existing_nid) + 1) if existing_nid else 0
+
+    abstracts = numbering.get('abstracts', {})
+    nums = numbering.get('nums', {})
+
+    aid_map = {}
+    for aid, xml in abstracts.items():
+        a = etree.fromstring(xml)
+        a.set(qn('w:abstractNumId'), str(int(aid) + aid_offset))
+        aid_map[aid] = str(int(aid) + aid_offset)
+        root.append(a)
+
+    num_map = {}
+    for numid, info in nums.items():
+        n = etree.fromstring(info['xml'])
+        n.set(qn('w:numId'), str(int(numid) + nid_offset))
+        aid_el = n.find(qn('w:abstractNumId'))
+        if aid_el is not None and info.get('abstractNumId') in aid_map:
+            aid_el.set(qn('w:val'), aid_map[info['abstractNumId']])
+        root.append(n)
+        num_map[numid] = str(int(numid) + nid_offset)
+    return num_map
+
+
 _IND_ATTRS = ('w:firstLine', 'w:firstLineChars', 'w:left', 'w:leftChars',
               'w:hanging', 'w:hangingChars', 'w:right', 'w:rightChars')
 
@@ -1688,16 +1764,18 @@ def validate_content(content):
     if fid is not None and resolve_fidelity(fid) is None:
         errors.append(f'fidelity：取值 {fid!r} 无法识别，可选 {FIDELITY_MODES}')
 
-    # 严格保真：任何"源文档里没有的字符"都要在生成前说出来
+    # 严格保真：编号不拼进正文字符，但通过复制 numbering 定义 + 段落 numPr
+    # 由 Word 原生渲染，可见编号与层级不丢。
     if resolve_fidelity(fid) == 'strict':
         items = body if isinstance(body, list) else []
-        npref = [bi for bi, it in enumerate(items)
-                 if isinstance(it, dict) and it.get('num_prefix')]
-        if npref:
+        nnum = [bi for bi, it in enumerate(items)
+                if isinstance(it, dict) and it.get('num_id') is not None]
+        if nnum:
             warns.append(
-                f'严格保真：body 中 {len(npref)} 段带 num_prefix'
-                f'（Word 自动编号，源文件里不是字符），未并入正文 —— '
-                f'成品中看不到这些编号。需要显示请用 --fidelity standard 重新提取。')
+                f'严格保真：body 中 {len(nnum)} 段带 Word 自动编号'
+                f'（num_id/num_ilvl），已通过复制编号定义保留原生编号，'
+                f'编号由 Word 渲染，未并入正文字符。'
+                f'若目标环境无法渲染自动编号，请改 --fidelity standard 固化为文字。')
         if attachments:
             warns.append(
                 '严格保真：attachments 会由生成器补「附件：」与序号字符，'
@@ -1815,6 +1893,10 @@ def build_document(content, output_path, on_exist=None):
     _date_text = _date_text or content.get('date') or ''
     _sig_right, _date_right = sign_date_indents(_sig_text, _date_text)
 
+    # 自动编号：把源文档 numbering 定义复制进来，保留原生编号（numId 重映射）。
+    # strict 下编号也不丢——编号由 Word 渲染，不是拼进正文的字符。
+    _num_map = apply_numbering(doc, content.get('_numbering') or {})
+
     for item in content.get('body', []):
         # 表格占位：{"type": "table", "index": 0}
         if isinstance(item, dict) and item.get('type') == 'table':
@@ -1877,11 +1959,18 @@ def build_document(content, output_path, on_exist=None):
                            bool(pag.get('keep_lines')),
                            bool(pag.get('page_break_before')))
             continue
-        add_paragraph(doc, text, font_name=font_by_role[font_role], bold=bold,
-                      align=align or WD_ALIGN_PARAGRAPH.JUSTIFY,
-                      keep_next=bool(pag.get('keep_next')),
-                      keep_lines=bool(pag.get('keep_lines')),
-                      page_break_before=bool(pag.get('page_break_before')))
+        para = add_paragraph(doc, text, font_name=font_by_role[font_role],
+                             bold=bold,
+                             align=align or WD_ALIGN_PARAGRAPH.JUSTIFY,
+                             keep_next=bool(pag.get('keep_next')),
+                             keep_lines=bool(pag.get('keep_lines')),
+                             page_break_before=bool(pag.get('page_break_before')))
+        # 自动编号：源段落带 numId/ilvl 时，给成品段落设同源 numPr，
+        # 编号由 Word 按复制进来的 numbering 定义渲染（保留层级与重启关系）
+        if isinstance(item, dict) and item.get('num_id') is not None:
+            src_nid = str(item['num_id'])
+            new_nid = _num_map.get(src_nid, src_nid)
+            set_numbering(para, new_nid, item.get('num_ilvl'))
 
     # 附件说明（7.3.4）：每个附件单独一段，回行与名称首字对齐
     attachments = [str(a).strip() for a in (content.get('attachments') or [])
