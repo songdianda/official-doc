@@ -95,8 +95,8 @@ def format_number(value, fmt):
     f = (fmt or '').lower()
     if f in ('bullet', 'none'):
         return None
-    if f in ('japanesecounting', 'chinesecounting', 'chineselegalsimplified',
-             'ideographdigital', 'ideographtraditional'):
+    if f in ('japanesecounting', 'chinesecounting', 'chinesecountingthousand',
+             'chineselegalsimplified', 'ideographdigital', 'ideographtraditional'):
         return cn_number(value)
     if f == 'lowerletter':
         return chr(ord('a') + value - 1) if 1 <= value <= 26 else str(value)
