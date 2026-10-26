@@ -7,22 +7,29 @@
 这个脚本**不检查版式**。版式（字体、行距、页码位置）要另外逐页看。
 它只回答一个问题：源文档里的东西，成品里还在不在。
 
-三道检查，各自独立、互不替代
+四道检查，各自独立、互不替代
   1. 原文覆盖    **直接从源文档读**，不经过提取结果。
                  源里每一段（含表格格、页眉页脚）都必须在成品里找得到，
                  找不到就是丢了。这一道专门防「提取 JSON 和成品同时漏掉同一段」
                  ——那种情况若只拿 JSON 当基准，会得出"一致"的假结论。
-  2. 表格逐格    按 (行, 列) 坐标比对，不是比内容集合。
+  2. 反向检查    成品里每一段也必须能在源里配对，配对后**多出来的字符**就是增字。
+                 只查"源有成品无"是不够的：给段落加个「二、」前缀，
+                 正向检查照样判一致——加字只能靠反向比对抓出来。
+  3. 表格逐格    按 (行, 列) 坐标比对，不是比内容集合。
                  集合比对抓不到"两格内容互换"和"重复值多一个少一个"。
                  合并单元格先按 w:gridSpan / w:vMerge 还原成逻辑格再比。
-  3. 图片        按部位分别计数：正文 / 页眉页脚 / 脚注尾注批注。
+  4. 图片        按部位分别计数：正文 / 页眉页脚 / 脚注尾注批注。
                  只看 body 会把页眉里的图片数成 0，页眉图丢了也报"一致"。
+
+严格保真（fidelity=strict，默认）
+  原文一个字不增不减。反向检查发现的增字、以及源文档没有却出现在成品里的
+  页码，都判为不通过。确属有意补充时用 --fidelity standard，增字降级为提示。
 
 有意调整的部分（不是缺陷，会在报告里单独说明）
   - 落款署名 / 成文日期被剥离到 signature / date，成品中位置改变但内容仍在
-  - Word 自动编号被补回成文字（源文件里它不是字符）
   - 版头整段原样复制（文本框内的字需目视确认）
   - 落款前后用于「顶下去」的空段落被清理
+  - standard 模式下 Word 自动编号被补回成文字（源文件里它不是字符）
 """
 
 import argparse
@@ -175,6 +182,63 @@ def match_one(text, pool):
     return False
 
 
+def match_extra(text, pool):
+    """反向配对：成品一段文字在源 pool 里找对应，返回**源里没有的字符**。
+
+    match_one 只回答"找不找得到"，互为子串就算命中——给段落加个「二、」
+    前缀，正向检查照样通过。这里把配对后剩余的前后缀算出来，
+    那才是真正多出来的字。
+      返回 ''    没有增字
+      返回 非空   增字内容（可能是整段，源里完全找不到）
+    """
+    n = _norm(text)
+    if not n:
+        return ''
+    # 先精确匹配，再退到子串，避免把带前后缀的段落误配给另一段
+    for i, cand in enumerate(pool):
+        if _norm(cand) == n:
+            pool.pop(i)
+            return ''
+    for i, cand in enumerate(pool):
+        c = _norm(cand)
+        if n in c:            # 成品是源的子串：成品少字，由正向检查负责
+            pool.pop(i)
+            return ''
+        if c in n:
+            pool.pop(i)
+            idx = n.find(c)
+            return n[:idx] + n[idx + len(c):]
+    return n                  # 源里完全没有 → 整段都是新增
+
+
+def body_texts(path):
+    """成品正文段落文字（不含表格、不含页眉页脚），逐条带位置。
+
+    页眉页脚必须排除：页码在页脚里，算进来会整段被当成增字。
+    """
+    doc = Document(path)
+    out = []
+    for i, p in enumerate(doc.paragraphs):
+        text = _all_text(p._element)
+        if text:
+            out.append({'text': text, 'where': f'成品正文段落[{i}]'})
+    return out
+
+
+def page_number_marks(path):
+    """页脚里是否有页码域（w:instrText 含 PAGE）。
+
+    只看文字不行：页码是域，未更新时取不到数字，但域代码一直在。
+    """
+    doc = Document(path)
+    marks = []
+    for el in _classify(doc)['header_footer']:
+        instr = ''.join(t.text or '' for t in el.iter(qn('w:instrText')))
+        if 'PAGE' in instr.upper():
+            marks.append(instr.strip() or '(空域)')
+    return marks
+
+
 # ── 表格：按坐标逐格比对 ──────────────────────────────────
 
 def table_grid(path):
@@ -241,6 +305,9 @@ def main():
     ap.add_argument('target', help='生成的 .docx')
     ap.add_argument('meta', nargs='?',
                     help='inspect_docx.py 输出的 JSON（可选，用于定位漏在哪个环节）')
+    ap.add_argument('--fidelity', choices=('strict', 'standard'), default=None,
+                    help='strict（默认）：增字与新增页码判不通过；'
+                         'standard：降级为提示')
     args = ap.parse_args()
 
     for p in (args.source, args.target):
@@ -255,6 +322,10 @@ def main():
             print(f'提取结果不存在: {args.meta}', file=sys.stderr)
             return 1
         meta = json.load(open(args.meta, encoding='utf-8'))
+
+    # 保真模式：优先命令行，其次提取结果，最后默认 strict
+    fidelity = args.fidelity or (meta or {}).get('fidelity') or 'strict'
+    strict = fidelity == 'strict'
 
     ok = True
     warns = []
@@ -297,7 +368,53 @@ def main():
     else:
         print('  源文档全部文字均可在成品中找到')
 
-    # ── 2. 表格逐格（带位置）────────────────────────────
+    # ── 2. 反向检查：成品里有没有源文档没有的字 ──────────
+    dst_body = body_texts(args.target)
+    rpool = [it['text'] for it in src_items if it['zone'] in ('正文', '表格')]
+    extras = []
+    for it in dst_body:
+        more = match_extra(it['text'], rpool)
+        if more:
+            extras.append((it, more))
+    print(f'\n【反向检查】成品 {len(dst_body)} 段正文，逐段在源文档中配对'
+          f'（保真模式：{fidelity}）')
+    if not extras:
+        print('  成品正文没有源文档以外的字符')
+    else:
+        head = ('  发现 %d 段含源文档没有的字符（增字）：' % len(extras))
+        if strict:
+            ok = False
+            print(head)
+        else:
+            warns.append(head.strip())
+            print(head + '（standard 模式，记为提示）')
+        for it, more in extras[:20]:
+            print(f'    × {it["where"]} 多出「{more[:40]}」｜整段：{it["text"][:50]}')
+        if len(extras) > 20:
+            print(f'    …… 另有 {len(extras) - 20} 段')
+
+    # ── 页码：源文档没有就不该有 ────────────────────────
+    src_pn = page_number_marks(args.source)
+    dst_pn = page_number_marks(args.target)
+    if dst_pn and not src_pn:
+        msg = ('源文档没有页码，成品页脚出现 %d 处页码域 —— 属于新增内容'
+               % len(dst_pn))
+        if strict:
+            ok = False
+            print(f'\n【页码】{msg}')
+        else:
+            warns.append(msg)
+            print(f'\n【页码】{msg}（standard 模式，记为提示）')
+        print('  确认要加页码的话：这是你显式指定的，可忽略；'
+              '否则检查 config 里的 page_number 是否被误设为 center / odd_even')
+    elif src_pn and not dst_pn:
+        warns.append('源文档有页码，成品没有 —— 页码未保留')
+        print('\n【页码】源文档有页码，成品未保留')
+    else:
+        print('\n【页码】源与成品一致'
+              + ('（均无页码域）' if not src_pn else '（均含页码域）'))
+
+    # ── 3. 表格逐格（带位置）────────────────────────────
     src_grids = table_grid(args.source)
     dst_grids = table_grid(args.target)
     same, diffs = compare_tables(src_grids, dst_grids)
@@ -352,9 +469,18 @@ def main():
             notes.append('落款已剥离后由生成器重新输出：'
                          + '、'.join(f"{s['field']}「{s['text']}」" for s in st))
         an = meta.get('_auto_number') or []
-        if an:
-            notes.append(f'Word 自动编号 {len(an)} 处已补回为文字'
-                         f'（源文件里不是字符）')
+        applied = [a for a in an if a.get('applied')]
+        skipped = [a for a in an if not a.get('applied')]
+        if applied:
+            notes.append(f'Word 自动编号 {len(applied)} 处已补回为文字'
+                         f'（源文件里不是字符，属 standard 模式的有意补充）')
+        if skipped:
+            notes.append(f'Word 自动编号 {len(skipped)} 处【未并入正文】'
+                         f'（严格保真：源文档里没有这几个字）：'
+                         + '、'.join(f'第{a["index"]}段「{a["text"]}」'
+                                     for a in skipped[:5])
+                         + ('…' if len(skipped) > 5 else '')
+                         + '　需手工补或改用 --fidelity standard')
         if meta.get('header'):
             n = len(meta['header']['indices'])
             notes.append(f'版头 {n} 段整段原样复制；'
@@ -368,8 +494,10 @@ def main():
         for n in notes:
             print(f'  - {n}')
 
-    print('\n结论：' + ('内容一致，未发现漏字、漏表、漏图' if ok
-                    else '存在内容差异，请按上述条目核对后再交付'))
+    verdict = ('内容一致：未发现漏字、增字、漏表、漏图'
+               + ('，也未新增页码' if strict else '')
+               if ok else '存在内容差异，请按上述条目核对后再交付')
+    print('\n结论：' + verdict)
     print('注意：本脚本只比对内容，不能证明版式正确，版式仍需逐页查看。')
     return 0 if ok else 2
 

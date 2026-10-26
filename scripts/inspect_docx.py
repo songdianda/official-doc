@@ -224,7 +224,8 @@ def detect_number_conflicts(paras):
         text = (sig.get('text') or '').strip()
         if not text:
             continue
-        source = '自动编号补回' if sig.get('autoNumber') else '原文'
+        # strict 下自动编号没有写进正文，措辞要说清，别让人以为已补回
+        source = ('自动编号（未并入正文）' if sig.get('autoNumber') else '原文')
         for label, pat in LEVEL_PATTERNS:
             m = pat.match(text)
             if not m:
@@ -319,8 +320,37 @@ def resolve_auto_number(p, defs, counters, last_values, style_num=None):
                   'value': value, 'text': text, 'bullet': False}
 
 
+FIDELITY_MODES = ('strict', 'standard')
+FIDELITY_DEFAULT = 'strict'
+FIDELITY_ALIASES = {
+    'strict': 'strict', '严格': 'strict', '保真': 'strict', 'strictfidelity': 'strict',
+    'standard': 'standard', '标准': 'standard', '补编号': 'standard',
+    'fill': 'standard', 'restore': 'standard',
+}
+
+
+def resolve_fidelity(value):
+    """保真模式归一：strict（默认）/ standard；无法识别返回 None。
+
+    strict   原文一个字不增不减。Word 自动编号在源文件里不是字符，
+              渲染出来补进正文就是"加字"，所以只作线索记录，不并入 text。
+    standard 把自动编号补回成文字（旧行为），适用于本来就要把
+              自动编号固化成字符的场景。
+    """
+    if value is None:
+        return FIDELITY_DEFAULT
+    key = str(value).strip().lower()
+    key = FIDELITY_ALIASES.get(key, key)
+    return key if key in FIDELITY_MODES else None
+
+
 def para_signals(p, index, auto_prefix=None, auto_info=None):
-    """采集一段的样式线索。auto_prefix 为 Word 自动编号渲染出的文本。"""
+    """采集一段的样式线索。auto_prefix 为 Word 自动编号渲染出的文本。
+
+    text      = 原文字符 + 自动编号（判读用，能看出「二、」这类层级）
+    raw_text  = 原文字符本身（严格保真输出用）
+    两者分开存：判读需要编号才能定层级，输出却不能凭空多出这几个字。
+    """
     r = p.runs[0] if p.runs else None
     rPr = r._element.rPr if (r is not None) else None
     rFonts = rPr.find(qn('w:rFonts')) if rPr is not None else None
@@ -334,12 +364,13 @@ def para_signals(p, index, auto_prefix=None, auto_info=None):
             except (TypeError, ValueError):
                 outline = None
     numPr = pPr is not None and pPr.find(qn('w:numPr')) is not None
-    text = p.text.strip()
-    if auto_prefix:
-        text = auto_prefix + text
+    raw_text = p.text.strip()
+    text = (auto_prefix + raw_text) if auto_prefix else raw_text
     return {
         'index': index,
         'text': text,
+        'raw_text': raw_text,
+        'auto_prefix': auto_prefix,
         'style': p.style.name if p.style is not None else None,
         'styleId': p.style.style_id if p.style is not None else None,
         'outlineLvl': outline,
@@ -696,13 +727,22 @@ def detect_letterhead(paras, elements):
     return picked, detail
 
 
-def build(path, strip_sign=True):
+def build(path, strip_sign=True, fidelity=FIDELITY_DEFAULT):
     """提取内容与角色建议（不修改原文）。
 
     strip_sign=False 时不剥离署名 / 成文日期，两段都留在 body。
     自动剥离靠的是格式特征，在名单式、表格化落款等特殊文档里可能判错，
     此时应由使用者自己决定怎么处理。
+
+    fidelity='strict'（默认）：原文一个字不增不减。
+    源文件里 Word 自动编号不是字符而是 w:numPr，把它渲染成「二、」写进
+    正文就是凭空加字——strict 下只记录线索，原样输出段落自身的字符。
     """
+    fidelity = resolve_fidelity(fidelity)
+    if fidelity is None:
+        raise ValueError(f'fidelity 取值无法识别：{fidelity!r}，'
+                         f'可选 {FIDELITY_MODES}')
+    strict = fidelity == 'strict'
     doc = Document(path)
 
     # 按文档流顺序遍历，否则表格相对段落的位置会丢失
@@ -750,7 +790,9 @@ def build(path, strip_sign=True):
             if info:
                 auto_numbered.append({'index': sig['index'], 'text': info['text'],
                                       'fmt': info['fmt'], 'value': info['value'],
-                                      'bullet': info['bullet']})
+                                      'bullet': info['bullet'],
+                                      # strict 下没有写进正文，只是线索
+                                      'applied': not strict})
             order.append(('para', len(paras) - 1))
         else:
             rows, spans, ncol = extract_table(obj)
@@ -823,21 +865,28 @@ def build(path, strip_sign=True):
         sig = paras[i]
         if i in dropped:
             continue
-        text = sig['text']
-        if (not seen_first and text.strip() and title_idx is not None
+        # disp 只用于判读（含自动编号，能看出「二、」这类层级）；
+        # 输出用 text：strict 下是原文字符本身，一个字都不加
+        disp = sig['text']
+        text = sig['raw_text'] if strict else sig['text']
+        if (not seen_first and disp.strip() and title_idx is not None
                 and i > title_idx):
             seen_first = True
-            if text.rstrip().endswith('：') and len(text) <= 40:
+            if disp.rstrip().endswith('：') and len(disp) <= 40:
                 candidates.append({
-                    'field': 'recipient', 'index': i, 'text': text,
+                    'field': 'recipient', 'index': i, 'text': disp,
                     'note': '疑似主送机关；确认后填入 recipient，并删除 body 中该段'})
-        elif ATTACH_PREFIX.match(text.strip()):
+        elif ATTACH_PREFIX.match(disp.strip()):
             candidates.append({
-                'field': 'attachments', 'index': i, 'text': text,
+                'field': 'attachments', 'index': i, 'text': disp,
                 'note': '疑似附件说明；确认后填入 attachments，并删除 body 中该段'})
 
         role, conf, reason = suggest(sig)
         item = {'type': role, 'text': text}
+        # strict 下自动编号不并入正文，但要把"这段其实有编号"记下来：
+        # 使用者据此决定要不要手工补，脚本不替他加
+        if strict and sig.get('auto_prefix'):
+            item['num_prefix'] = sig['auto_prefix']
         # 分页控制原样带走：源段落设了「与下段同页」，成品也要设，否则标题会掉页底
         item.update(_para_pagination(elements[i]))
         item['_src'] = {
@@ -852,10 +901,14 @@ def build(path, strip_sign=True):
         }
         body.append(item)
         if conf != 'high':
-            uncertain.append({'index': sig['index'], 'text': sig['text'][:60],
+            uncertain.append({'index': sig['index'], 'text': disp[:60],
                               'suggested': role, 'reason': reason})
 
-    title = paras[title_idx]['text'].strip() if title_idx is not None else ''
+    if title_idx is None:
+        title = ''
+    else:
+        title = (paras[title_idx]['raw_text'] if strict
+                 else paras[title_idx]['text']).strip()
     # 标题的「与下段同页」：公文标题几乎都设了，丢了就是标题落在页末
     title_pag = (_para_pagination(elements[title_idx])
                  if title_idx is not None else {})
@@ -866,6 +919,7 @@ def build(path, strip_sign=True):
     result = {
         'title': title,
         'page_number': pn['mode'],
+        'fidelity': fidelity,
         'body': body,
         '_uncertain': uncertain,
         '_note': ('_src / _uncertain / _candidates 为判读线索，可删除；'
@@ -881,13 +935,21 @@ def build(path, strip_sign=True):
                   '（与下段同页 / 段中不分页），原样带走到成品；'
                   '不需要可删除。'),
     }
+    if strict:
+        result['_note'] += (
+            '【严格保真】fidelity=strict：正文每段只输出源文件里真实存在的字符。'
+            'Word 自动编号（w:numPr）不并入正文——它在源文件里不是字符，'
+            '补进去就是加字；带自动编号的段落另给 num_prefix 字段记录待补内容，'
+            '是否补由使用者决定。需要补回时用 --fidelity standard 重新提取。')
     if title_pag.get('keep_next'):
         # 只在确实设了的时候写，没设就不写——保持 JSON 干净
         result['title_keep_next'] = True
     if sig_idx is not None:
-        result['signature'] = paras[sig_idx]['text'].strip()
+        result['signature'] = (paras[sig_idx]['raw_text'] if strict
+                               else paras[sig_idx]['text']).strip()
     if date_idx is not None:
-        result['date'] = paras[date_idx]['text'].strip()
+        result['date'] = (paras[date_idx]['raw_text'] if strict
+                          else paras[date_idx]['text']).strip()
     stripped = []
     for i, field in ((sig_idx, 'signature'), (date_idx, 'date')):
         if i is None:
@@ -897,7 +959,8 @@ def build(path, strip_sign=True):
         rec = {
             'index': i,
             'field': field,
-            'text': paras[i]['text'].strip(),
+            'text': (paras[i]['raw_text'] if strict
+                     else paras[i]['text']).strip(),
             'reason': (STRIP_REASON['date'] if field == 'date'
                        else STRIP_REASON['signature']),
             'confidence': 'high' if field == 'date' else 'medium',
@@ -953,13 +1016,17 @@ def main():
     ap.add_argument('--no-strip', action='store_true',
                     help='不剥离署名与成文日期，两段都留在 body'
                          '（自动剥离在特殊文档中可能判错时使用）')
+    ap.add_argument('--fidelity', choices=FIDELITY_MODES, default=FIDELITY_DEFAULT,
+                    help='strict（默认）：原文一个字不增不减，Word 自动编号只记线索、'
+                         '不并入正文；standard：把自动编号补回成文字')
     args = ap.parse_args()
 
     if not os.path.exists(args.docx):
         print(f'文件不存在: {args.docx}', file=sys.stderr)
         return 1
 
-    result = build(args.docx, strip_sign=not args.no_strip)
+    result = build(args.docx, strip_sign=not args.no_strip,
+                   fidelity=args.fidelity)
     if args.no_meta:
         for item in result['body']:
             item.pop('_src', None)
@@ -982,7 +1049,13 @@ def main():
             print(f'页码：源文件已有页码 → 沿用 {mode}')
         an = result.get('_auto_number') or []
         if an:
-            print(f'自动编号：{len(an)} 处由 Word 生成（不在原文字符里），已补回文本：')
+            strict = result.get('fidelity') == 'strict'
+            if strict:
+                print(f'自动编号：{len(an)} 处由 Word 生成（源文件里不是字符）。'
+                      f'【严格保真】未并入正文，编号写在对应段的 num_prefix 字段，'
+                      f'是否补由你决定；要补请用 --fidelity standard 重新提取：')
+            else:
+                print(f'自动编号：{len(an)} 处由 Word 生成（不在原文字符里），已补回文本：')
             for a in an:
                 print(f'   第{a["index"]}段 → 「{a["text"]}」'
                       f'（{a["fmt"]}，值={a["value"]}）')

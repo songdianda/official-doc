@@ -778,7 +778,10 @@ def detect_level(text):
 #   odd_even  奇偶页不同——单页居右空一字、双页居左空一字（GB/T 9704-2012 7.5）
 #   none      不显示页码
 PAGE_NUMBER_MODES = ('center', 'odd_even', 'none')
-PAGE_NUMBER_DEFAULT = 'center'
+# 默认 none：源文档没有页码就不许凭空加。
+# 页码属于源文件"有没有"的事实，不是排版偏好——从无到有是新增内容，
+# 与"原文一个字不增不减"冲突。要加必须由使用者显式指定。
+PAGE_NUMBER_DEFAULT = 'none'
 
 # 页码别名，容错常见写法
 PAGE_NUMBER_ALIASES = {
@@ -815,6 +818,25 @@ ON_EXIST_ALIASES = {
     'overwrite': 'overwrite', 'replace': 'overwrite', 'force': 'overwrite',
     '覆盖': 'overwrite', '替换': 'overwrite',
 }
+
+
+# 保真模式：strict = 原文一个字不增不减（默认）。
+# standard 仅用于"本来就要把 Word 自动编号固化成字符"的场景。
+FIDELITY_MODES = ('strict', 'standard')
+FIDELITY_DEFAULT = 'strict'
+FIDELITY_ALIASES = {
+    'strict': 'strict', '严格': 'strict', '保真': 'strict',
+    'standard': 'standard', '标准': 'standard', '补编号': 'standard',
+}
+
+
+def resolve_fidelity(value):
+    """保真模式归一：strict（默认）/ standard；无法识别返回 None。"""
+    if value is None:
+        return FIDELITY_DEFAULT
+    key = str(value).strip().lower()
+    key = FIDELITY_ALIASES.get(key, key)
+    return key if key in FIDELITY_MODES else None
 
 
 def resolve_on_exist(value):
@@ -1121,6 +1143,26 @@ def validate_content(content):
                              for i in idxs)):
                 errors.append(f'header.indices：应为整数列表，实际是 {idxs!r}')
 
+    fid = content.get('fidelity')
+    if fid is not None and resolve_fidelity(fid) is None:
+        errors.append(f'fidelity：取值 {fid!r} 无法识别，可选 {FIDELITY_MODES}')
+
+    # 严格保真：任何"源文档里没有的字符"都要在生成前说出来
+    if resolve_fidelity(fid) == 'strict':
+        items = body if isinstance(body, list) else []
+        npref = [bi for bi, it in enumerate(items)
+                 if isinstance(it, dict) and it.get('num_prefix')]
+        if npref:
+            warns.append(
+                f'严格保真：body 中 {len(npref)} 段带 num_prefix'
+                f'（Word 自动编号，源文件里不是字符），未并入正文 —— '
+                f'成品中看不到这些编号。需要显示请用 --fidelity standard 重新提取。')
+        if attachments:
+            warns.append(
+                '严格保真：attachments 会由生成器补「附件：」与序号字符，'
+                '这些字源文档里没有。如需一字不增，请把附件说明原段放进 body，'
+                '并清空 attachments。')
+
     if errors:
         raise ValueError(
             f'输入数据校验未通过，共 {len(errors)} 处：\n  - '
@@ -1147,9 +1189,12 @@ def build_document(content, output_path, on_exist=None):
       attachments 附件名称列表（可选）
       signature   发文机关署名（可选）
       date        成文日期（可选）
-      page_number 页码样式：center（无源文件时默认，居中）/
-                  odd_even（奇偶页不同）/ none（不显示）
-                  有源文件时由 inspect_docx.py 按源文档推断
+      page_number 页码样式：none（默认，不添加）/ center（居中）/
+                  odd_even（奇偶页不同）
+                  有源文件时由 inspect_docx.py 按源文档推断：源无页码→none，
+                  源有页码→沿用。从无到有属于新增内容，必须显式指定才加
+      fidelity    保真模式：strict（默认，原文一字不增不减，
+                  自动编号不并入正文）/ standard（补回自动编号）
       output      输出路径（可选，优先级低于 output_path 参数）
       on_exist    输出文件已存在时的处理：rename（默认，自动另存）/ fail / overwrite
                   （同名字段优先级低于 on_exist 参数）
@@ -1377,7 +1422,11 @@ def main():
                              '（默认）/ fail 停止并提示 / overwrite 覆盖')
     parser.add_argument('--page-number', dest='page_number',
                         choices=PAGE_NUMBER_MODES, default=None,
-                        help='页码样式：center 居中（默认）/ odd_even 奇偶页不同 / none 不显示')
+                        help='页码样式：none 不显示（默认，源文档没有就不加）/ '
+                             'center 居中 / odd_even 奇偶页不同')
+    parser.add_argument('--fidelity', choices=FIDELITY_MODES, default=None,
+                        help='保真模式：strict（默认）原文一字不增不减，'
+                             '自动编号只记线索不并入正文；standard 补回自动编号')
     parser.add_argument('--check-fonts', action='store_true', help='检查字体并退出')
     args = parser.parse_args()
 
@@ -1403,6 +1452,8 @@ def main():
         # 命令行显式指定时覆盖配置文件
         if args.page_number:
             content['page_number'] = args.page_number
+        if args.fidelity:
+            content['fidelity'] = args.fidelity
     else:
         if not args.title:
             parser.error('需要 --config，或至少提供 --title')
